@@ -175,9 +175,14 @@ contract AuctionPoolHook is BaseHook {
         PoolId poolId = key.toId();
         AuctionState storage state = poolAuctions[poolId];
 
+        // Check against the higher of current state rent or next bid rent
+        uint256 currentRent = state.rentPerBlock > nextBid[poolId].rentPerBlock
+            ? state.rentPerBlock
+            : nextBid[poolId].rentPerBlock;
+
         // Validation
         require(
-            rentPerBlock >= state.rentPerBlock + MIN_BID_INCREMENT,
+            rentPerBlock >= currentRent + MIN_BID_INCREMENT,
             "Bid must exceed current rent"
         );
         require(
@@ -194,20 +199,15 @@ contract AuctionPoolHook is BaseHook {
             timestamp: block.timestamp
         });
 
-        // If this beats current next bid, replace it
-        if (rentPerBlock > nextBid[poolId].rentPerBlock) {
-            // Refund previous next bidder
-            if (nextBid[poolId].bidder != address(0)) {
-                _refundBid(poolId);
-            }
-
-            nextBid[poolId] = newBid;
-            bidHistory[poolId].push(newBid);
-
-            emit BidSubmitted(poolId, msg.sender, rentPerBlock, msg.value);
-        } else {
-            revert("Bid does not beat next bid");
+        // Refund previous next bidder if exists
+        if (nextBid[poolId].bidder != address(0)) {
+            _refundBid(poolId);
         }
+
+        nextBid[poolId] = newBid;
+        bidHistory[poolId].push(newBid);
+
+        emit BidSubmitted(poolId, msg.sender, rentPerBlock, msg.value);
     }
 
     /**
@@ -333,15 +333,18 @@ contract AuctionPoolHook is BaseHook {
 
             // Install new manager
             address oldManager = state.currentManager;
-            state.currentManager = next.bidder;
-            state.rentPerBlock = next.rentPerBlock;
+            address newManager = next.bidder;
+            uint256 newRent = next.rentPerBlock;
+
+            state.currentManager = newManager;
+            state.rentPerBlock = newRent;
             state.managerDeposit = next.deposit;
             state.lastRentBlock = block.number;
 
             // Clear next bid
             delete nextBid[poolId];
 
-            emit ManagerChanged(poolId, oldManager, next.bidder, next.rentPerBlock);
+            emit ManagerChanged(poolId, oldManager, newManager, newRent);
         }
     }
 
@@ -476,6 +479,9 @@ contract AuctionPoolHook is BaseHook {
         PoolId poolId = key.toId();
         AuctionState storage state = poolAuctions[poolId];
 
+        // Decode actual LP address from hookData, fallback to sender if not provided
+        address lp = hookData.length > 0 ? abi.decode(hookData, (address)) : sender;
+
         // Only charge fee if liquidity is being removed (negative delta)
         if (params.liquidityDelta < 0) {
             uint256 withdrawalAmount = uint256(-params.liquidityDelta);
@@ -487,19 +493,19 @@ contract AuctionPoolHook is BaseHook {
             }
 
             // Claim any pending rent before shares change
-            uint256 pending = getPendingRent(poolId, sender);
+            uint256 pending = getPendingRent(poolId, lp);
             if (pending > 0) {
-                rentPerShareClaimed[poolId][sender] = rentPerShareAccumulated[poolId];
-                payable(sender).transfer(pending);
-                emit RentClaimed(poolId, sender, pending);
+                rentPerShareClaimed[poolId][lp] = rentPerShareAccumulated[poolId];
+                payable(lp).transfer(pending);
+                emit RentClaimed(poolId, lp, pending);
             }
 
             // Update LP shares
-            lpShares[poolId][sender] -= withdrawalAmount;
+            lpShares[poolId][lp] -= withdrawalAmount;
             totalShares[poolId] -= withdrawalAmount;
 
-            emit WithdrawalFeeCharged(poolId, sender, withdrawalFee);
-            emit LiquidityUpdated(poolId, sender, withdrawalAmount, false);
+            emit WithdrawalFeeCharged(poolId, lp, withdrawalFee);
+            emit LiquidityUpdated(poolId, lp, withdrawalAmount, false);
         }
 
         return IHooks.beforeRemoveLiquidity.selector;
@@ -526,28 +532,31 @@ contract AuctionPoolHook is BaseHook {
     ) internal override returns (bytes4 selector_, BalanceDelta hookDelta_) {
         PoolId poolId = key.toId();
 
-        // Adding liquidity - update shares
-        if (params.liquidityDelta > 0) {
+        // Decode actual LP address from hookData, fallback to sender if not provided
+        address lp = hookData.length > 0 ? abi.decode(hookData, (address)) : sender;
+
+        // Adding liquidity - update shares (skip if lp is address(0))
+        if (params.liquidityDelta > 0 && lp != address(0)) {
             uint256 addAmount = uint256(params.liquidityDelta);
 
             // Claim any pending rent before shares change
-            uint256 pending = getPendingRent(poolId, sender);
+            uint256 pending = getPendingRent(poolId, lp);
             if (pending > 0) {
-                rentPerShareClaimed[poolId][sender] = rentPerShareAccumulated[poolId];
-                payable(sender).transfer(pending);
-                emit RentClaimed(poolId, sender, pending);
+                rentPerShareClaimed[poolId][lp] = rentPerShareAccumulated[poolId];
+                payable(lp).transfer(pending);
+                emit RentClaimed(poolId, lp, pending);
             }
 
             // Update shares
-            lpShares[poolId][sender] += addAmount;
+            lpShares[poolId][lp] += addAmount;
             totalShares[poolId] += addAmount;
 
             // Set claimed to current accumulated if first deposit
-            if (rentPerShareClaimed[poolId][sender] == 0) {
-                rentPerShareClaimed[poolId][sender] = rentPerShareAccumulated[poolId];
+            if (rentPerShareClaimed[poolId][lp] == 0) {
+                rentPerShareClaimed[poolId][lp] = rentPerShareAccumulated[poolId];
             }
 
-            emit LiquidityUpdated(poolId, sender, addAmount, true);
+            emit LiquidityUpdated(poolId, lp, addAmount, true);
         }
 
         return (IHooks.afterAddLiquidity.selector, BalanceDelta.wrap(0));

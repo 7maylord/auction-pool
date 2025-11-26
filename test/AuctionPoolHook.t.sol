@@ -63,6 +63,19 @@ contract AuctionPoolHookTest is Test, Deployers {
         vm.deal(alice, 100 ether);
         vm.deal(bob, 100 ether);
         vm.deal(charlie, 100 ether);
+
+        // Add initial liquidity to pool so swaps can work
+        // Use address(0) in hookData to indicate this liquidity shouldn't be tracked
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 10e18,
+                salt: bytes32(0)
+            }),
+            abi.encode(address(0))  // address(0) = don't track
+        );
     }
 
     // ===== BID SUBMISSION TESTS =====
@@ -157,12 +170,11 @@ contract AuctionPoolHookTest is Test, Deployers {
         vm.roll(block.number + hook.ACTIVATION_DELAY() + 1);
 
         // Trigger auction update via swap
-        vm.prank(bob);
         vm.expectEmit(true, true, true, true);
         emit AuctionPoolHook.ManagerChanged(poolId, address(0), alice, rentPerBlock);
 
-        // Execute a swap to trigger beforeSwap hook
-        swap(key, true, 1e18, "");
+        // Execute a swap to trigger beforeSwap hook (use small amount to avoid price limit)
+        swap(key, true, 0.001e18, "");
 
         // Verify Alice is now manager
         (address currentManager, , , , , ) = hook.poolAuctions(poolId);
@@ -170,15 +182,15 @@ contract AuctionPoolHookTest is Test, Deployers {
     }
 
     function testAuctionUpdateManagerDepleted() public {
-        // Alice becomes manager
+        // Alice becomes manager with minimum deposit
         uint256 rentPerBlock = 1000 wei;
-        uint256 deposit = rentPerBlock * 50; // Only 50 blocks worth
+        uint256 deposit = rentPerBlock * hook.MIN_DEPOSIT_BLOCKS();
 
         vm.prank(alice);
         hook.submitBid{value: deposit}(key, rentPerBlock);
 
         vm.roll(block.number + hook.ACTIVATION_DELAY() + 1);
-        swap(key, true, 1e18, ""); // Alice becomes manager
+        swap(key, true, 0.001e18, ""); // Alice becomes manager
 
         // Bob submits higher bid
         uint256 rentPerBlock2 = rentPerBlock + hook.MIN_BID_INCREMENT();
@@ -187,13 +199,13 @@ contract AuctionPoolHookTest is Test, Deployers {
         vm.prank(bob);
         hook.submitBid{value: deposit2}(key, rentPerBlock2);
 
-        // Fast forward beyond Alice's deposit
-        vm.roll(block.number + 60);
+        // Fast forward beyond Alice's deposit (100 blocks + some extra to deplete)
+        vm.roll(block.number + 110);
 
-        // Trigger update - Alice should be replaced
+        // Trigger update - Alice should be replaced because deposit is depleted
         vm.expectEmit(true, true, true, true);
         emit AuctionPoolHook.ManagerChanged(poolId, alice, bob, rentPerBlock2);
-        swap(key, true, 1e18, "");
+        swap(key, true, 0.001e18, "");
 
         // Verify Bob is now manager
         (address currentManager, , , , , ) = hook.poolAuctions(poolId);
@@ -247,11 +259,16 @@ contract AuctionPoolHookTest is Test, Deployers {
         vm.prank(alice);
         hook.setSwapFee(key, normalFee);
 
+        // Give alice tokens to swap
+        MockERC20(Currency.unwrap(currency0)).mint(alice, 1e18);
+        vm.startPrank(alice);
+        MockERC20(Currency.unwrap(currency0)).approve(address(swapRouter), type(uint256).max);
+
         // When Alice swaps, she should get zero fee
         // This is tested implicitly through the beforeSwap hook
-        vm.prank(alice);
         // The swap should succeed with zero fee for manager
-        swap(key, true, 1e18, "");
+        swap(key, true, 0.001e18, "");
+        vm.stopPrank();
     }
 
     // ===== RENT COLLECTION TESTS =====
@@ -335,8 +352,7 @@ contract AuctionPoolHookTest is Test, Deployers {
         _makeAliceManager();
         _addLiquidity(bob, 1e18);
 
-        // Bob removes liquidity
-        vm.prank(bob);
+        // Bob removes liquidity (prank is done inside _removeLiquidity)
         vm.expectEmit(true, true, false, false);
         emit AuctionPoolHook.WithdrawalFeeCharged(poolId, bob, 0);
         _removeLiquidity(bob, 0.5e18);
@@ -398,12 +414,13 @@ contract AuctionPoolHookTest is Test, Deployers {
     function testGetBidHistory() public {
         uint256 rent1 = 1000 wei;
         uint256 rent2 = 1500 wei;
+        uint256 minDeposit = hook.MIN_DEPOSIT_BLOCKS();
 
         vm.prank(alice);
-        hook.submitBid{value: rent1 * hook.MIN_DEPOSIT_BLOCKS()}(key, rent1);
+        hook.submitBid{value: rent1 * minDeposit}(key, rent1);
 
         vm.prank(bob);
-        hook.submitBid{value: rent2 * hook.MIN_DEPOSIT_BLOCKS()}(key, rent2);
+        hook.submitBid{value: rent2 * minDeposit}(key, rent2);
 
         AuctionPoolHook.Bid[] memory history = hook.getBidHistory(poolId);
         assertEq(history.length, 2);
@@ -421,7 +438,8 @@ contract AuctionPoolHookTest is Test, Deployers {
         hook.submitBid{value: deposit}(key, rentPerBlock);
 
         vm.roll(block.number + hook.ACTIVATION_DELAY() + 1);
-        swap(key, true, 1e18, "");
+        // Small swap to trigger auction update
+        swap(key, true, 0.001e18, "");
     }
 
     function _makeManagerWithRent(address manager, uint256 rentPerBlock) internal {
@@ -431,11 +449,21 @@ contract AuctionPoolHookTest is Test, Deployers {
         hook.submitBid{value: deposit}(key, rentPerBlock);
 
         vm.roll(block.number + hook.ACTIVATION_DELAY() + 1);
-        swap(key, true, 1e18, "");
+        // Small swap to trigger auction update
+        swap(key, true, 0.001e18, "");
     }
 
     function _addLiquidity(address lp, uint256 amount) internal {
-        vm.prank(lp);
+        // Mint tokens to LP if they don't have enough
+        MockERC20(Currency.unwrap(currency0)).mint(lp, amount * 2);
+        MockERC20(Currency.unwrap(currency1)).mint(lp, amount * 2);
+
+        // Approve router to spend tokens
+        vm.startPrank(lp);
+        MockERC20(Currency.unwrap(currency0)).approve(address(modifyLiquidityRouter), type(uint256).max);
+        MockERC20(Currency.unwrap(currency1)).approve(address(modifyLiquidityRouter), type(uint256).max);
+
+        // Pass LP address in hookData so hook knows who the real LP is
         modifyLiquidityRouter.modifyLiquidity(
             key,
             ModifyLiquidityParams({
@@ -444,8 +472,9 @@ contract AuctionPoolHookTest is Test, Deployers {
                 liquidityDelta: int256(amount),
                 salt: bytes32(0)
             }),
-            ""
+            abi.encode(lp)  // Pass LP address in hookData
         );
+        vm.stopPrank();
     }
 
     function _removeLiquidity(address lp, uint256 amount) internal {
@@ -458,7 +487,7 @@ contract AuctionPoolHookTest is Test, Deployers {
                 liquidityDelta: -int256(amount),
                 salt: bytes32(0)
             }),
-            ""
+            abi.encode(lp)  // Pass LP address in hookData
         );
     }
 }
