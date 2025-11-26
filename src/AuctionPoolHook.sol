@@ -1,173 +1,578 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.22;
- 
+
 import {SwapMath} from '@uniswap/v4-core/src/libraries/SwapMath.sol';
 import {Hooks, IHooks} from '@uniswap/v4-core/src/libraries/Hooks.sol';
 import {BalanceDelta} from '@uniswap/v4-core/src/types/BalanceDelta.sol';
 import {Currency, CurrencyLibrary} from '@uniswap/v4-core/src/types/Currency.sol';
 import {PoolId, PoolIdLibrary} from '@uniswap/v4-core/src/types/PoolId.sol';
 import {PoolKey} from '@uniswap/v4-core/src/types/PoolKey.sol';
-import {BeforeSwapDelta, toBeforeSwapDelta} from '@uniswap/v4-core/src/types/BeforeSwapDelta.sol';
+import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from '@uniswap/v4-core/src/types/BeforeSwapDelta.sol';
 import {ModifyLiquidityParams, SwapParams} from '@uniswap/v4-core/src/types/PoolOperation.sol';
 import {StateLibrary} from '@uniswap/v4-core/src/libraries/StateLibrary.sol';
 import {CurrencySettler} from '@uniswap/v4-core/test/utils/CurrencySettler.sol';
- 
+import {LPFeeLibrary} from '@uniswap/v4-core/src/libraries/LPFeeLibrary.sol';
+
 import {IERC20Minimal} from '@uniswap/v4-core/src/interfaces/external/IERC20Minimal.sol';
 import {IPoolManager} from '@uniswap/v4-core/src/interfaces/IPoolManager.sol';
- 
+
 import {BaseHook} from 'v4-periphery/src/utils/BaseHook.sol';
- 
- 
+
+
 /**
- * This contract sets up our Uniswap V4 integration, allowing for hook logic to be applied
- * to our pools. This also implements pool fee management and LP reward distribution through
- * the `donate` logic.
+ * @title AuctionPoolHook - Auction-Managed AMM
+ * @notice Implements an auction mechanism where sophisticated operators bid for the right
+ * to manage a pool, set dynamic fees, and capture arbitrage opportunities.
+ * @dev Based on research from Uniswap Labs and Paradigm (https://arxiv.org/abs/2403.03367)
  *
- * When fees are collected they will be distributed between the Uniswap V4 pool that was
- * interacted with, to promote liquidity, and an optional beneficiary.
- *
- * The calculation of the fees paid into the {FeeCollector} should be undertaken by the
- * individual contracts that are calling it.
+ * Key features:
+ * - Continuous auction for pool management rights
+ * - Dynamic fee setting by managers (up to MAX_FEE cap)
+ * - Guaranteed rent payments to LPs
+ * - Zero-fee trading for managers to capture arbitrage
+ * - Censorship-resistant bid activation delays
  */
 contract AuctionPoolHook is BaseHook {
- 
+
     using CurrencyLibrary for Currency;
     using CurrencySettler for Currency;
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
- 
-    /// Minimum threshold for donations
-    uint public constant DONATE_THRESHOLD_MIN = 0.0001 ether;
- 
-    /// The native token address
-    address public immutable nativeToken;
- 
+
+    // ===== AUCTION STATE STRUCTS =====
+
     /**
-     * The amount of claimable tokens that are available to be `distributed` for a `PoolId`.
-     *
-     * @param amount0 The amount of currency0 that is available to be distributed
-     * @param amount1 The amount of currency1 that is available to be distributed
+     * @notice Current state of the auction for a pool
      */
-    struct ClaimableFees {
-        uint amount0;
-        uint amount1;
+    struct AuctionState {
+        address currentManager;      // Current pool manager address
+        uint256 rentPerBlock;        // Current rent rate (wei per block)
+        uint256 managerDeposit;      // Manager's remaining deposit
+        uint256 lastRentBlock;       // Last block rent was collected
+        uint24 currentFee;           // Current swap fee (in hundredths of bps)
+        uint256 totalRentPaid;       // Cumulative rent paid (for stats)
     }
- 
-    /// Maps the amount of claimable tokens that are available to be `distributed`
-    /// for a `PoolId`.
-    mapping (PoolId _poolId => ClaimableFees _fees) internal _poolFees;
- 
+
     /**
-     * Sets our immutable {PoolManager} contract reference, used to initialise the BaseHook,
-     * and also validates that the contract implementing this adheres to the hook address
-     * validation.
+     * @notice Represents a bid to become pool manager
      */
-    constructor (address _poolManager, address _nativeToken) BaseHook(IPoolManager(_poolManager)) {
-        nativeToken = _nativeToken;
+    struct Bid {
+        address bidder;              // Address of bidder
+        uint256 rentPerBlock;        // Rent they're willing to pay
+        uint256 deposit;             // Upfront deposit amount
+        uint256 activationBlock;     // Block when bid becomes active
+        uint256 timestamp;           // When bid was submitted
     }
- 
+
+    // ===== CONFIGURATION CONSTANTS =====
+
+    uint24 public constant MAX_FEE = 10000;           // 1% max fee (in hundredths of bps)
+    uint256 public constant ACTIVATION_DELAY = 5;      // blocks
+    uint24 public constant WITHDRAWAL_FEE = 1;         // 0.01% (in hundredths of bps)
+    uint256 public constant MIN_BID_INCREMENT = 100;   // 100 wei/block minimum increase
+    uint256 public constant MIN_DEPOSIT_BLOCKS = 100;  // Deposit must cover 100 blocks
+
+    // ===== STATE MAPPINGS =====
+
+    /// Pool ID => Auction State
+    mapping(PoolId => AuctionState) public poolAuctions;
+
+    /// Pool ID => Next highest bid (waiting to activate)
+    mapping(PoolId => Bid) public nextBid;
+
+    /// Pool ID => Bid history (for analytics)
+    mapping(PoolId => Bid[]) public bidHistory;
+
+    // ===== LP TRACKING FOR RENT DISTRIBUTION =====
+
+    /// Pool ID => LP address => shares
+    mapping(PoolId => mapping(address => uint256)) public lpShares;
+
+    /// Pool ID => total shares
+    mapping(PoolId => uint256) public totalShares;
+
+    /// Pool ID => accumulated rent per share (scaled by 1e18)
+    mapping(PoolId => uint256) public rentPerShareAccumulated;
+
+    /// Pool ID => LP address => rent per share already claimed
+    mapping(PoolId => mapping(address => uint256)) public rentPerShareClaimed;
+
+    // ===== MANAGER BALANCES =====
+
+    /// Manager address => Pool ID => collected fees
+    mapping(address => mapping(PoolId => uint256)) public managerFees;
+
     /**
-     * Provides the {ClaimableFees} for a pool.
-     *
-     * @param _poolKey The PoolKey of the pool
-     *
-     * @return The {ClaimableFees} for the pool
+     * @notice Constructor sets up the hook with PoolManager reference
+     * @param _poolManager Address of the Uniswap v4 PoolManager
      */
-    function poolFees(PoolKey calldata _poolKey) public view returns (ClaimableFees memory) {
-        return _poolFees[_poolKey.toId()];
-    }
- 
+    constructor(address _poolManager) BaseHook(IPoolManager(_poolManager)) {}
+
+    // ===== EVENTS =====
+
+    event BidSubmitted(
+        PoolId indexed poolId,
+        address indexed bidder,
+        uint256 rentPerBlock,
+        uint256 deposit
+    );
+
+    event ManagerChanged(
+        PoolId indexed poolId,
+        address indexed oldManager,
+        address indexed newManager,
+        uint256 rentPerBlock
+    );
+
+    event FeeUpdated(
+        PoolId indexed poolId,
+        address indexed manager,
+        uint24 newFee
+    );
+
+    event RentCollected(
+        PoolId indexed poolId,
+        uint256 amount,
+        uint256 blockNumber
+    );
+
+    event RentClaimed(
+        PoolId indexed poolId,
+        address indexed lp,
+        uint256 amount
+    );
+
+    event WithdrawalFeeCharged(
+        PoolId indexed poolId,
+        address indexed lp,
+        uint256 fee
+    );
+
+    event ManagerFeesWithdrawn(
+        PoolId indexed poolId,
+        address indexed manager,
+        uint256 amount
+    );
+
+    event LiquidityUpdated(
+        PoolId indexed poolId,
+        address indexed lp,
+        uint256 shares,
+        bool isAddition
+    );
+
+    // ===== AUCTION MANAGEMENT FUNCTIONS =====
+
     /**
-     * When fees are collected against a collection it is sent as ETH in a payable
-     * transaction to this function. This then handles the distribution of the
-     * allocation between the `_poolId` specified and, if set, a percentage for
-     * the `beneficiary`.
-     *
-     * Our `amount0` must always refer to the amount of the native token provided. The
-     * `amount1` will always be the underlying {CollectionToken}. The internal logic of
-     * this function will rearrange them to match the `PoolKey` if needed.
-     *
-     * @param _poolKey The PoolKey of the pool
-     * @param _amount0 The amount of currency0 to deposit
-     * @param _amount1 The amount of currency1 to deposit
+     * @notice Submit a bid to become pool manager
+     * @param key Pool key
+     * @param rentPerBlock Rent willing to pay per block (in wei)
      */
-    function depositFees(PoolKey calldata _poolKey, uint _amount0, uint _amount1) public {
-        _poolFees[_poolKey.toId()].amount0 += _amount0;
-        _poolFees[_poolKey.toId()].amount1 += _amount1;
+    function submitBid(
+        PoolKey calldata key,
+        uint256 rentPerBlock
+    ) external payable {
+        PoolId poolId = key.toId();
+        AuctionState storage state = poolAuctions[poolId];
+
+        // Validation
+        require(
+            rentPerBlock >= state.rentPerBlock + MIN_BID_INCREMENT,
+            "Bid must exceed current rent"
+        );
+        require(
+            msg.value >= rentPerBlock * MIN_DEPOSIT_BLOCKS,
+            "Insufficient deposit"
+        );
+
+        // Create bid with activation delay (censorship resistance)
+        Bid memory newBid = Bid({
+            bidder: msg.sender,
+            rentPerBlock: rentPerBlock,
+            deposit: msg.value,
+            activationBlock: block.number + ACTIVATION_DELAY,
+            timestamp: block.timestamp
+        });
+
+        // If this beats current next bid, replace it
+        if (rentPerBlock > nextBid[poolId].rentPerBlock) {
+            // Refund previous next bidder
+            if (nextBid[poolId].bidder != address(0)) {
+                _refundBid(poolId);
+            }
+
+            nextBid[poolId] = newBid;
+            bidHistory[poolId].push(newBid);
+
+            emit BidSubmitted(poolId, msg.sender, rentPerBlock, msg.value);
+        } else {
+            revert("Bid does not beat next bid");
+        }
     }
- 
+
     /**
-     * Before a swap is made, we pull in the dynamic pool fee that we have set to ensure it is
-     * applied to the tx.
-     *
-     * We also see if we have any token1 fee tokens that we can use to fill the swap before it
-     * hits the Uniswap pool. This prevents the pool from being affected and reduced gas costs.
-     * This also allows us to benefit from the Uniswap routing infrastructure.
-     *
+     * @notice Manager sets dynamic swap fee
+     * @param key Pool key
+     * @param newFee New fee in hundredths of basis points
+     */
+    function setSwapFee(
+        PoolKey calldata key,
+        uint24 newFee
+    ) external {
+        PoolId poolId = key.toId();
+        AuctionState storage state = poolAuctions[poolId];
+
+        require(msg.sender == state.currentManager, "Not manager");
+        require(newFee <= MAX_FEE, "Fee exceeds cap");
+
+        state.currentFee = newFee;
+
+        emit FeeUpdated(poolId, msg.sender, newFee);
+    }
+
+    /**
+     * @notice LP claims accumulated rent
+     * @param key Pool key
+     */
+    function claimRent(PoolKey calldata key) external {
+        PoolId poolId = key.toId();
+
+        uint256 userShares = lpShares[poolId][msg.sender];
+        require(userShares > 0, "No LP position");
+
+        uint256 claimable = getPendingRent(poolId, msg.sender);
+        require(claimable > 0, "No rent to claim");
+
+        // Update claimed amount
+        rentPerShareClaimed[poolId][msg.sender] = rentPerShareAccumulated[poolId];
+
+        payable(msg.sender).transfer(claimable);
+
+        emit RentClaimed(poolId, msg.sender, claimable);
+    }
+
+    /**
+     * @notice Manager withdraws accumulated fees
+     * @param key Pool key
+     */
+    function withdrawManagerFees(PoolKey calldata key) external {
+        PoolId poolId = key.toId();
+
+        uint256 fees = managerFees[msg.sender][poolId];
+        require(fees > 0, "No fees to withdraw");
+
+        managerFees[msg.sender][poolId] = 0;
+
+        payable(msg.sender).transfer(fees);
+
+        emit ManagerFeesWithdrawn(poolId, msg.sender, fees);
+    }
+
+    // ===== VIEW FUNCTIONS =====
+
+    /**
+     * @notice Get pending rent for an LP
+     * @param poolId Pool identifier
+     * @param lp LP address
+     * @return Pending rent amount
+     */
+    function getPendingRent(PoolId poolId, address lp) public view returns (uint256) {
+        uint256 userShares = lpShares[poolId][lp];
+        if (userShares == 0) return 0;
+
+        uint256 accumulatedRent = rentPerShareAccumulated[poolId];
+        uint256 claimedRent = rentPerShareClaimed[poolId][lp];
+
+        return (userShares * (accumulatedRent - claimedRent)) / 1e18;
+    }
+
+    /**
+     * @notice Get bid history for a pool
+     * @param poolId Pool identifier
+     * @return Array of bids
+     */
+    function getBidHistory(PoolId poolId) external view returns (Bid[] memory) {
+        return bidHistory[poolId];
+    }
+
+    // ===== INTERNAL AUCTION LOGIC =====
+
+    /**
+     * @notice Update auction - switch to new manager if bid is ready
+     * @param poolId Pool identifier
+     */
+    function _updateAuction(PoolId poolId) internal {
+        AuctionState storage state = poolAuctions[poolId];
+        Bid storage next = nextBid[poolId];
+
+        // Check if next bid should activate
+        bool shouldActivate = (
+            next.bidder != address(0) &&
+            next.activationBlock <= block.number &&
+            next.rentPerBlock > state.rentPerBlock
+        );
+
+        // Check if current manager ran out of deposit
+        uint256 blocksSinceRent = state.lastRentBlock > 0 ? block.number - state.lastRentBlock : 0;
+        uint256 rentOwed = blocksSinceRent * state.rentPerBlock;
+        bool managerDepleted = (state.managerDeposit > 0 && rentOwed >= state.managerDeposit);
+
+        if (shouldActivate || managerDepleted) {
+            // Collect any outstanding rent before transition
+            if (state.currentManager != address(0) && state.managerDeposit > 0 && blocksSinceRent > 0) {
+                uint256 finalRent = rentOwed > state.managerDeposit ? state.managerDeposit : rentOwed;
+                state.managerDeposit -= finalRent;
+                state.totalRentPaid += finalRent;
+                _distributeRent(poolId, finalRent);
+            }
+
+            // Refund old manager's remaining deposit
+            if (state.currentManager != address(0) && state.managerDeposit > 0) {
+                payable(state.currentManager).transfer(state.managerDeposit);
+            }
+
+            // Install new manager
+            address oldManager = state.currentManager;
+            state.currentManager = next.bidder;
+            state.rentPerBlock = next.rentPerBlock;
+            state.managerDeposit = next.deposit;
+            state.lastRentBlock = block.number;
+
+            // Clear next bid
+            delete nextBid[poolId];
+
+            emit ManagerChanged(poolId, oldManager, next.bidder, next.rentPerBlock);
+        }
+    }
+
+    /**
+     * @notice Collect rent from manager and distribute to LPs
+     * @param poolId Pool identifier
+     */
+    function _collectRent(PoolId poolId) internal {
+        AuctionState storage state = poolAuctions[poolId];
+
+        if (state.currentManager == address(0) || state.lastRentBlock == 0) return;
+
+        uint256 blocksSinceRent = block.number - state.lastRentBlock;
+        uint256 rentOwed = blocksSinceRent * state.rentPerBlock;
+
+        if (rentOwed > 0 && rentOwed <= state.managerDeposit) {
+            // Deduct from manager's deposit
+            state.managerDeposit -= rentOwed;
+            state.lastRentBlock = block.number;
+            state.totalRentPaid += rentOwed;
+
+            // Distribute to LPs proportionally
+            _distributeRent(poolId, rentOwed);
+
+            emit RentCollected(poolId, rentOwed, block.number);
+        }
+    }
+
+    /**
+     * @notice Distribute rent to LPs proportionally using rewards-per-share accounting
+     * @param poolId Pool identifier
+     * @param amount Total rent amount to distribute
+     */
+    function _distributeRent(PoolId poolId, uint256 amount) internal {
+        uint256 total = totalShares[poolId];
+
+        if (total == 0) return;
+
+        // Update accumulated rent per share (scaled by 1e18 for precision)
+        rentPerShareAccumulated[poolId] += (amount * 1e18) / total;
+    }
+
+    /**
+     * @notice Refund the current next bidder
+     * @param poolId Pool identifier
+     */
+    function _refundBid(PoolId poolId) internal {
+        Bid storage bid = nextBid[poolId];
+        if (bid.bidder != address(0) && bid.deposit > 0) {
+            payable(bid.bidder).transfer(bid.deposit);
+        }
+    }
+
+    // ===== HOOK IMPLEMENTATIONS =====
+
+    /**
+     * @notice Before swap hook - apply dynamic fee and collect rent
      * @param sender The initial msg.sender for the swap call
      * @param key The key for the pool
      * @param params The parameters for the swap
-     * @param hookData Arbitrary data handed into the PoolManager by the swapper to be be passed on to the hook
-     *
+     * @param hookData Arbitrary data handed into the PoolManager
      * @return selector_ The function selector for the hook
-     * @return beforeSwapDelta_ The hook's delta in specified and unspecified currencies. Positive: the hook is owed/took currency, negative: the hook owes/sent currency
-     * @return swapFee_ The percentage fee applied to our swap
+     * @return beforeSwapDelta_ The hook's delta in specified and unspecified currencies
+     * @return swapFee_ The dynamic fee applied to the swap
      */
-    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata hookData) internal override returns (bytes4 selector_, BeforeSwapDelta beforeSwapDelta_, uint24 swapFee_) {
-        selector_ = IHooks.beforeSwap.selector;
+    function _beforeSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        bytes calldata hookData
+    ) internal override returns (bytes4 selector_, BeforeSwapDelta beforeSwapDelta_, uint24 swapFee_) {
+        PoolId poolId = key.toId();
+        AuctionState storage state = poolAuctions[poolId];
+
+        // Step 1: Update auction if needed (check if new bidder should take over)
+        _updateAuction(poolId);
+
+        // Step 2: Collect rent from current manager
+        _collectRent(poolId);
+
+        // Step 3: Get current dynamic fee
+        uint24 swapFee = state.currentFee;
+
+        // Special case: If sender is the manager, they trade with zero fee
+        if (sender == state.currentManager) {
+            swapFee = 0; // Manager can arb for free
+        }
+
+        return (
+            IHooks.beforeSwap.selector,
+            BeforeSwapDeltaLibrary.ZERO_DELTA,
+            swapFee | LPFeeLibrary.OVERRIDE_FEE_FLAG
+        );
     }
- 
+
     /**
-     * Once a swap has been made, we distribute fees to our LPs and emit our price update event.
-     *
+     * @notice After swap hook - track fees collected
      * @param sender The initial msg.sender for the swap call
      * @param key The key for the pool
      * @param params The parameters for the swap
      * @param delta The amount owed to the caller (positive) or owed to the pool (negative)
-     * @param hookData Arbitrary data handed into the PoolManager by the swapper to be be passed on to the hook
-     *
+     * @param hookData Arbitrary data handed into the PoolManager
      * @return selector_ The function selector for the hook
-     * @return hookDeltaUnspecified_ The hook's delta in unspecified currency. Positive: the hook is owed/took currency, negative: the hook owes/sent currency
+     * @return hookDeltaUnspecified_ The hook's delta in unspecified currency
      */
-    function _afterSwap(address sender, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata hookData) internal override returns (bytes4 selector_, int128 hookDeltaUnspecified_) {
-        selector_ = IHooks.afterSwap.selector;
+    function _afterSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata hookData
+    ) internal override returns (bytes4 selector_, int128 hookDeltaUnspecified_) {
+        // Fees are collected by PoolManager and can be tracked here if needed
+        // For now, we just return the selector
+        return (IHooks.afterSwap.selector, 0);
     }
- 
+
     /**
-     * Takes a collection address and, if there is sufficient fees available to
-     * claim, will call the `donate` function against the mapped Uniswap V4 pool.
-     *
-     * @dev This call could be checked in a Uniswap V4 interactions hook to
-     * dynamically process fees when they hit a threshold.
-     *
-     * @param _poolKey The PoolKey reference that will have fees distributed
+     * @notice Before remove liquidity hook - charge withdrawal fee and update shares
+     * @param sender The initial msg.sender
+     * @param key The key for the pool
+     * @param params The parameters for modifying liquidity
+     * @param hookData Arbitrary data handed into the PoolManager
+     * @return selector_ The function selector for the hook
      */
-    function _distributeFees(PoolKey calldata _poolKey) internal {
-        //
+    function _beforeRemoveLiquidity(
+        address sender,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
+        bytes calldata hookData
+    ) internal override returns (bytes4) {
+        PoolId poolId = key.toId();
+        AuctionState storage state = poolAuctions[poolId];
+
+        // Only charge fee if liquidity is being removed (negative delta)
+        if (params.liquidityDelta < 0) {
+            uint256 withdrawalAmount = uint256(-params.liquidityDelta);
+            uint256 withdrawalFee = (withdrawalAmount * WITHDRAWAL_FEE) / 1000000;
+
+            // Credit withdrawal fee to current manager (in ETH/native token)
+            if (state.currentManager != address(0)) {
+                managerFees[state.currentManager][poolId] += withdrawalFee;
+            }
+
+            // Claim any pending rent before shares change
+            uint256 pending = getPendingRent(poolId, sender);
+            if (pending > 0) {
+                rentPerShareClaimed[poolId][sender] = rentPerShareAccumulated[poolId];
+                payable(sender).transfer(pending);
+                emit RentClaimed(poolId, sender, pending);
+            }
+
+            // Update LP shares
+            lpShares[poolId][sender] -= withdrawalAmount;
+            totalShares[poolId] -= withdrawalAmount;
+
+            emit WithdrawalFeeCharged(poolId, sender, withdrawalFee);
+            emit LiquidityUpdated(poolId, sender, withdrawalAmount, false);
+        }
+
+        return IHooks.beforeRemoveLiquidity.selector;
     }
- 
+
     /**
-     * This function defines the hooks that are required, and also importantly those which are
-     * not, by our contract. This output determines the contract address that the deployment
-     * must conform to and is validated in the constructor of this contract.
+     * @notice After add liquidity hook - update LP shares
+     * @param sender The initial msg.sender
+     * @param key The key for the pool
+     * @param params The parameters for modifying liquidity
+     * @param delta The caller's balance delta
+     * @param feesAccrued The fees accrued since the last time fees were collected from this position
+     * @param hookData Arbitrary data handed into the PoolManager
+     * @return selector_ The function selector for the hook
+     * @return hookDelta_ The hook's delta in specified and unspecified currencies
+     */
+    function _afterAddLiquidity(
+        address sender,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
+        BalanceDelta delta,
+        BalanceDelta feesAccrued,
+        bytes calldata hookData
+    ) internal override returns (bytes4 selector_, BalanceDelta hookDelta_) {
+        PoolId poolId = key.toId();
+
+        // Adding liquidity - update shares
+        if (params.liquidityDelta > 0) {
+            uint256 addAmount = uint256(params.liquidityDelta);
+
+            // Claim any pending rent before shares change
+            uint256 pending = getPendingRent(poolId, sender);
+            if (pending > 0) {
+                rentPerShareClaimed[poolId][sender] = rentPerShareAccumulated[poolId];
+                payable(sender).transfer(pending);
+                emit RentClaimed(poolId, sender, pending);
+            }
+
+            // Update shares
+            lpShares[poolId][sender] += addAmount;
+            totalShares[poolId] += addAmount;
+
+            // Set claimed to current accumulated if first deposit
+            if (rentPerShareClaimed[poolId][sender] == 0) {
+                rentPerShareClaimed[poolId][sender] = rentPerShareAccumulated[poolId];
+            }
+
+            emit LiquidityUpdated(poolId, sender, addAmount, true);
+        }
+
+        return (IHooks.afterAddLiquidity.selector, BalanceDelta.wrap(0));
+    }
+
+    /**
+     * @notice Defines the hook permissions
      */
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: false,
             afterInitialize: false,
             beforeAddLiquidity: false,
-            afterAddLiquidity: false,
-            beforeRemoveLiquidity: false,
+            afterAddLiquidity: true,
+            beforeRemoveLiquidity: true,
             afterRemoveLiquidity: false,
             beforeSwap: true,
             afterSwap: true,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: true,
-            afterSwapReturnDelta: true,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: false,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
     }
- 
+
 }
