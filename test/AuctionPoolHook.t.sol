@@ -428,6 +428,215 @@ contract AuctionPoolHookTest is Test, Deployers {
         assertEq(history[1].bidder, bob);
     }
 
+    // ===== EDGE CASE TESTS =====
+
+    function testMultipleConsecutiveManagerChanges() public {
+        // Alice becomes manager
+        uint256 rent1 = 1000 wei;
+        _makeManagerWithRent(alice, rent1);
+
+        // Bob outbids and becomes manager
+        uint256 rent2 = rent1 + hook.MIN_BID_INCREMENT();
+        uint256 deposit2 = rent2 * hook.MIN_DEPOSIT_BLOCKS();
+        vm.prank(bob);
+        hook.submitBid{value: deposit2}(key, rent2);
+
+        vm.roll(block.number + hook.ACTIVATION_DELAY() + 1);
+        swap(key, true, 0.001e18, "");
+
+        (address currentManager, , , , , ) = hook.poolAuctions(poolId);
+        assertEq(currentManager, bob);
+
+        // Charlie outbids and becomes manager
+        uint256 rent3 = rent2 + hook.MIN_BID_INCREMENT();
+        uint256 deposit3 = rent3 * hook.MIN_DEPOSIT_BLOCKS();
+        vm.prank(charlie);
+        hook.submitBid{value: deposit3}(key, rent3);
+
+        vm.roll(block.number + hook.ACTIVATION_DELAY() + 1);
+        swap(key, true, 0.001e18, "");
+
+        (currentManager, , , , , ) = hook.poolAuctions(poolId);
+        assertEq(currentManager, charlie);
+    }
+
+    function testRentCollectionWithZeroShares() public {
+        // Alice becomes manager
+        _makeAliceManager();
+
+        // Try to collect rent when no LPs have shares
+        // The pool should handle this gracefully
+        vm.roll(block.number + 10);
+
+        // Swap triggers rent collection
+        swap(key, true, 0.001e18, "");
+
+        // Verify manager deposit was reduced appropriately
+        (, , uint256 deposit, , , ) = hook.poolAuctions(poolId);
+        assertLt(deposit, 1000 wei * hook.MIN_DEPOSIT_BLOCKS());
+    }
+
+    function testLPClaimsRentMultipleTimes() public {
+        // Alice becomes manager, Bob is LP
+        uint256 rentPerBlock = 1000 wei;
+        _makeManagerWithRent(alice, rentPerBlock);
+        _addLiquidity(bob, 1e18);
+
+        // Fast forward and trigger rent collection
+        vm.roll(block.number + 10);
+        swap(key, true, 0.001e18, "");
+
+        // Bob claims rent
+        uint256 bobBalanceBefore = bob.balance;
+        vm.prank(bob);
+        hook.claimRent(key);
+        uint256 firstClaim = bob.balance - bobBalanceBefore;
+        assertGt(firstClaim, 0);
+
+        // Fast forward and accumulate more rent
+        vm.roll(block.number + 10);
+        swap(key, true, 0.001e18, "");
+
+        // Bob claims rent again
+        bobBalanceBefore = bob.balance;
+        vm.prank(bob);
+        hook.claimRent(key);
+        uint256 secondClaim = bob.balance - bobBalanceBefore;
+        assertGt(secondClaim, 0);
+    }
+
+    function testWithdrawManagerFeesRevertNoFees() public {
+        _makeAliceManager();
+
+        // Try to withdraw with no fees
+        vm.prank(alice);
+        vm.expectRevert("No fees to withdraw");
+        hook.withdrawManagerFees(key);
+    }
+
+    function testClaimRentRevertNoPosition() public {
+        _makeAliceManager();
+
+        // Bob has no LP position, try to claim
+        vm.prank(bob);
+        vm.expectRevert("No LP position");
+        hook.claimRent(key);
+    }
+
+    function testClaimRentRevertNoRent() public {
+        _makeAliceManager();
+        _addLiquidity(bob, 1e18);
+
+        // Bob tries to claim immediately with no accumulated rent
+        vm.prank(bob);
+        vm.expectRevert("No rent to claim");
+        hook.claimRent(key);
+    }
+
+    function testPendingRentCalculation() public {
+        // Alice becomes manager, Bob is LP
+        uint256 rentPerBlock = 1000 wei;
+        _makeManagerWithRent(alice, rentPerBlock);
+        _addLiquidity(bob, 1e18);
+
+        // Verify initial pending rent is 0
+        assertEq(hook.getPendingRent(poolId, bob), 0);
+
+        // Fast forward and trigger rent collection
+        vm.roll(block.number + 10);
+        swap(key, true, 0.001e18, "");
+
+        // Verify pending rent increased
+        uint256 pending = hook.getPendingRent(poolId, bob);
+        assertGt(pending, 0);
+    }
+
+    function testMultipleLPsRentDistribution() public {
+        // Alice becomes manager
+        uint256 rentPerBlock = 1000 wei;
+        _makeManagerWithRent(alice, rentPerBlock);
+
+        // Bob and Charlie add equal liquidity
+        _addLiquidity(bob, 1e18);
+        _addLiquidity(charlie, 1e18);
+
+        // Fast forward and trigger rent collection
+        vm.roll(block.number + 100);
+        swap(key, true, 0.001e18, "");
+
+        // Both should have equal pending rent
+        uint256 bobPending = hook.getPendingRent(poolId, bob);
+        uint256 charliePending = hook.getPendingRent(poolId, charlie);
+
+        assertGt(bobPending, 0);
+        assertEq(bobPending, charliePending);
+    }
+
+    function testUnequalLPsRentDistribution() public {
+        // Alice becomes manager
+        uint256 rentPerBlock = 1000 wei;
+        _makeManagerWithRent(alice, rentPerBlock);
+
+        // Bob adds 2x liquidity compared to Charlie
+        _addLiquidity(bob, 2e18);
+        _addLiquidity(charlie, 1e18);
+
+        // Fast forward and trigger rent collection
+        vm.roll(block.number + 100);
+        swap(key, true, 0.001e18, "");
+
+        // Bob should have 2x the pending rent of Charlie
+        uint256 bobPending = hook.getPendingRent(poolId, bob);
+        uint256 charliePending = hook.getPendingRent(poolId, charlie);
+
+        assertGt(bobPending, 0);
+        assertGt(charliePending, 0);
+        assertApproxEqRel(bobPending, charliePending * 2, 0.01e18); // Within 1% due to rounding
+    }
+
+    function testRentAccumulationWithoutLPs() public {
+        // Alice becomes manager but no LPs
+        uint256 rentPerBlock = 1000 wei;
+        _makeManagerWithRent(alice, rentPerBlock);
+
+        uint256 initialDeposit = rentPerBlock * hook.MIN_DEPOSIT_BLOCKS();
+        (, , uint256 depositBefore, , , ) = hook.poolAuctions(poolId);
+        assertEq(depositBefore, initialDeposit);
+
+        // Fast forward and trigger rent collection
+        vm.roll(block.number + 10);
+        swap(key, true, 0.001e18, "");
+
+        // Deposit should be reduced even without LPs
+        (, , uint256 depositAfter, , , ) = hook.poolAuctions(poolId);
+        assertLt(depositAfter, depositBefore);
+    }
+
+    function testBidHistoryPersistence() public {
+        // Submit multiple bids over time
+        uint256 minDeposit = hook.MIN_DEPOSIT_BLOCKS();
+        uint256 minIncrement = hook.MIN_BID_INCREMENT();
+
+        uint256 rent1 = 1000 wei;
+        vm.prank(alice);
+        hook.submitBid{value: rent1 * minDeposit}(key, rent1);
+
+        uint256 rent2 = rent1 + minIncrement;
+        vm.prank(bob);
+        hook.submitBid{value: rent2 * minDeposit}(key, rent2);
+
+        uint256 rent3 = rent2 + minIncrement;
+        vm.prank(charlie);
+        hook.submitBid{value: rent3 * minDeposit}(key, rent3);
+
+        // All bids should be in history
+        AuctionPoolHook.Bid[] memory history = hook.getBidHistory(poolId);
+        assertEq(history.length, 3);
+        assertEq(history[0].bidder, alice);
+        assertEq(history[1].bidder, bob);
+        assertEq(history[2].bidder, charlie);
+    }
+
     // ===== HELPER FUNCTIONS =====
 
     function _makeAliceManager() internal {
