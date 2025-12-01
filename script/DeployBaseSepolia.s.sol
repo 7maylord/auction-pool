@@ -20,7 +20,7 @@ import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
  * - Chain ID: 84532
  *
  * Usage:
- *   source .env.base-sepolia
+ *   source .env
  *   forge script script/DeployBaseSepolia.s.sol:DeployBaseSepoliaScript \
  *     --rpc-url $RPC_URL \
  *     --broadcast \
@@ -43,7 +43,7 @@ contract DeployBaseSepoliaScript is Script {
     function run() public {
         // Load configuration
         bytes32 salt = vm.envOr("HOOK_SALT", bytes32(0));
-        uint256 minStakeEth = vm.envOr("MIN_STAKE_AMOUNT_ETH", uint256(1));
+        uint256 minStakeWei = vm.envOr("MIN_STAKE_AMOUNT_ETH", uint256(10000000000000000)); // Default 0.01 ETH
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
@@ -57,7 +57,7 @@ contract DeployBaseSepoliaScript is Script {
         console2.log("");
         console2.log("Deployer:", deployer);
         console2.log("Pool Manager:", POOL_MANAGER);
-        console2.log("Min Stake:", minStakeEth, "ETH");
+        console2.log("Min Stake:", minStakeWei / 1 ether, "ETH");
         console2.log("");
 
         vm.startBroadcast(deployerPrivateKey);
@@ -81,12 +81,12 @@ contract DeployBaseSepoliaScript is Script {
             console2.log("3. Re-run this script");
             console2.log("");
 
-            hook = new AuctionPoolHook(IPoolManager(POOL_MANAGER));
+            hook = new AuctionPoolHook(POOL_MANAGER);
 
             console2.log("[WARN] Hook deployed WITHOUT proper address!");
         } else {
             console2.log("Using CREATE2 salt:", vm.toString(salt));
-            hook = new AuctionPoolHook{salt: salt}(IPoolManager(POOL_MANAGER));
+            hook = new AuctionPoolHook{salt: salt}(POOL_MANAGER);
 
             // Verify flags
             uint160 addressFlags = uint160(address(hook)) & FLAGS_MASK;
@@ -109,13 +109,13 @@ contract DeployBaseSepoliaScript is Script {
         console2.log("Step 2: Deploying AuctionPoolAVSServiceManager...");
         console2.log("--------------------------------------------------------------------------------");
 
-        uint256 minStakeWei = minStakeEth * 1 ether;
         AuctionPoolAVSServiceManager avsManager = new AuctionPoolAVSServiceManager(
             minStakeWei
         );
 
         console2.log("AuctionPoolAVSServiceManager deployed at:", address(avsManager));
-        console2.log("Min stake requirement:", minStakeWei, "wei (", minStakeEth, "ETH)");
+        console2.log("Min stake requirement (wei):", minStakeWei);
+        console2.log("Min stake requirement (ETH):", minStakeWei / 1 ether);
         console2.log("");
 
         // =============================================================================
@@ -174,9 +174,10 @@ contract DeployBaseSepoliaScript is Script {
         // Initialize pool at 1:1 price (sqrtPriceX96)
         uint160 sqrtPriceX96 = 79228162514264337593543950336; // sqrt(1) << 96
 
-        try IPoolManager(POOL_MANAGER).initialize(poolKey, sqrtPriceX96, "") {
+        try IPoolManager(POOL_MANAGER).initialize(poolKey, sqrtPriceX96) {
             console2.log("[OK] Pool initialized successfully!");
-            console2.log("Pool ID:", PoolId.unwrap(poolId));
+            console2.log("Pool ID:");
+            console2.log(vm.toString(PoolId.unwrap(poolId)));
             console2.log("Initial price: 1:1");
         } catch Error(string memory reason) {
             console2.log("[WARN] Pool initialization failed:", reason);
@@ -210,7 +211,8 @@ contract DeployBaseSepoliaScript is Script {
         console2.log("");
 
         console2.log("Test Pool:");
-        console2.log("  Pool ID:", PoolId.unwrap(poolId));
+        console2.log("  Pool ID:");
+        console2.log("  ", vm.toString(PoolId.unwrap(poolId)));
         console2.log("  Token0:", token0Addr);
         console2.log("  Token1:", token1Addr);
         console2.log("  Tick Spacing: 60");
@@ -226,7 +228,7 @@ contract DeployBaseSepoliaScript is Script {
         console2.log("  MIN_DEPOSIT_BLOCKS:", hook.MIN_DEPOSIT_BLOCKS());
         console2.log("  ACTIVATION_DELAY:", hook.ACTIVATION_DELAY(), "blocks");
         console2.log("  MIN_BID_INCREMENT:", hook.MIN_BID_INCREMENT(), "wei");
-        console2.log("  MAX_SWAP_FEE:", hook.MAX_SWAP_FEE(), "(1%)");
+        console2.log("  MAX_FEE:", hook.MAX_FEE(), "(1%)");
         console2.log("  WITHDRAWAL_FEE:", hook.WITHDRAWAL_FEE(), "(0.01%)");
         console2.log("");
 
@@ -238,30 +240,24 @@ contract DeployBaseSepoliaScript is Script {
         console2.log("");
 
         // =============================================================================
-        // Step 6: Save Deployment Info
+        // Step 6: Display Deployment Addresses
         // =============================================================================
 
-        console2.log("Step 6: Saving deployment addresses...");
+        console2.log("Step 6: Deployment Addresses");
         console2.log("--------------------------------------------------------------------------------");
-
-        string memory deploymentInfo = string.concat(
-            "# Base Sepolia Deployment\n",
-            "# Deployed at block ", vm.toString(block.number), "\n",
-            "# Timestamp: ", vm.toString(block.timestamp), "\n\n",
-            "BASE_SEPOLIA_HOOK_ADDRESS=", vm.toString(address(hook)), "\n",
-            "BASE_SEPOLIA_AVS_MANAGER_ADDRESS=", vm.toString(address(avsManager)), "\n",
-            "BASE_SEPOLIA_POOL_MANAGER=", vm.toString(POOL_MANAGER), "\n",
-            "BASE_SEPOLIA_TOKEN_A=", vm.toString(address(tokenA)), "\n",
-            "BASE_SEPOLIA_TOKEN_B=", vm.toString(address(tokenB)), "\n",
-            "BASE_SEPOLIA_TOKEN0=", vm.toString(token0Addr), "\n",
-            "BASE_SEPOLIA_TOKEN1=", vm.toString(token1Addr), "\n",
-            "BASE_SEPOLIA_POOL_ID=", vm.toString(PoolId.unwrap(poolId)), "\n",
-            "DEPLOYMENT_BLOCK=", vm.toString(block.number), "\n",
-            "DEPLOYMENT_TIMESTAMP=", vm.toString(block.timestamp), "\n"
-        );
-
-        vm.writeFile(".env.base-sepolia.deployed", deploymentInfo);
-        console2.log("[OK] Deployment info saved to .env.base-sepolia.deployed");
+        console2.log("");
+        console2.log("Save these to .env.deployed:");
+        console2.log("");
+        console2.log("BASE_SEPOLIA_HOOK_ADDRESS=", vm.toString(address(hook)));
+        console2.log("BASE_SEPOLIA_AVS_MANAGER_ADDRESS=", vm.toString(address(avsManager)));
+        console2.log("BASE_SEPOLIA_POOL_MANAGER=", vm.toString(POOL_MANAGER));
+        console2.log("BASE_SEPOLIA_TOKEN_A=", vm.toString(address(tokenA)));
+        console2.log("BASE_SEPOLIA_TOKEN_B=", vm.toString(address(tokenB)));
+        console2.log("BASE_SEPOLIA_TOKEN0=", vm.toString(token0Addr));
+        console2.log("BASE_SEPOLIA_TOKEN1=", vm.toString(token1Addr));
+        console2.log("BASE_SEPOLIA_POOL_ID=", vm.toString(PoolId.unwrap(poolId)));
+        console2.log("DEPLOYMENT_BLOCK=", vm.toString(block.number));
+        console2.log("DEPLOYMENT_TIMESTAMP=", vm.toString(block.timestamp));
         console2.log("");
 
         // =============================================================================
@@ -279,7 +275,8 @@ contract DeployBaseSepoliaScript is Script {
         console2.log("  Token B: https://sepolia.basescan.org/address/", vm.toString(address(tokenB)));
         console2.log("");
         console2.log("Pool Details:");
-        console2.log("  Pool ID:", PoolId.unwrap(poolId));
+        console2.log("  Pool ID:");
+        console2.log("  ", vm.toString(PoolId.unwrap(poolId)));
         console2.log("  Token0:", token0Addr);
         console2.log("  Token1:", token1Addr);
         console2.log("  Price: 1:1");
@@ -313,7 +310,8 @@ contract DeployBaseSepoliaScript is Script {
         console2.log("   - Optimize fees dynamically");
         console2.log("");
         console2.log("   Use this pool ID for bids:");
-        console2.log("   POOL_ID=", PoolId.unwrap(poolId));
+        console2.log("   POOL_ID=");
+        console2.log("   ", vm.toString(PoolId.unwrap(poolId)));
         console2.log("");
 
         vm.stopBroadcast();

@@ -12,6 +12,7 @@ docs/
 
 # Dotenv file
 .env
+.env.deployed
 
 
 # Documentation - exclude all .md files except root README.md

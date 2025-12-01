@@ -24,12 +24,17 @@ contract MineSaltScript is Script {
     uint160 constant FLAGS_MASK = 0xFFFF; // Lower 16 bits
 
     function run() public {
-        address poolManager = vm.envAddress("POOL_MANAGER");
-        address deployer = vm.addr(vm.envUint("PRIVATE_KEY"));
+        address poolManager = vm.envAddress("POOL_MANAGER_ADDRESS");
+        address userDeployer = vm.addr(vm.envUint("PRIVATE_KEY"));
+
+        // Foundry uses CREATE2 deployer when broadcasting with {salt: salt}
+        // This is the canonical CREATE2 factory address
+        address create2Deployer = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
         console2.log("=== Mining Salt for AuctionPoolHook ===");
         console2.log("Pool Manager:", poolManager);
-        console2.log("Deployer:", deployer);
+        console2.log("User Deployer:", userDeployer);
+        console2.log("CREATE2 Deployer:", create2Deployer);
         console2.log("Required Flags:", HOOK_FLAGS);
         console2.log("");
 
@@ -44,8 +49,8 @@ contract MineSaltScript is Script {
         console2.log("This may take a while depending on the flags required");
         console2.log("");
 
-        // Mine for a salt
-        (bytes32 salt, address hookAddress) = mineSalt(deployer, creationCodeHash, HOOK_FLAGS);
+        // Mine for a salt using CREATE2 deployer address
+        (bytes32 salt, address hookAddress) = mineSalt(create2Deployer, creationCodeHash, HOOK_FLAGS);
 
         console2.log("=== FOUND VALID SALT ===");
         console2.log("Salt:", vm.toString(salt));
