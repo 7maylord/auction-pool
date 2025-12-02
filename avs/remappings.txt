@@ -1,0 +1,4 @@
+forge-std/=../lib/forge-std/src/
+@openzeppelin/contracts/=./lib/eigenlayer-contracts/lib/openzeppelin-contracts/contracts/
+@openzeppelin-upgrades/contracts/=./lib/eigenlayer-contracts/lib/openzeppelin-contracts-upgradeable/contracts/
+eigenlayer-contracts/=./lib/eigenlayer-contracts/

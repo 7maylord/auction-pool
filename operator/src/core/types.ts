@@ -2,7 +2,6 @@
  * Core types for AVS Operator using functional programming principles
  */
 
-import { BigNumber } from 'ethers';
 import * as t from 'io-ts';
 
 // ============================================================================
@@ -18,7 +17,7 @@ export interface Address {
 }
 
 export interface Wei {
-  readonly value: BigNumber;
+  readonly value: bigint;
 }
 
 export interface Percentage {
@@ -40,8 +39,8 @@ export interface PoolState {
   readonly currentManager: Address | null;
   readonly rentPerBlock: Wei;
   readonly swapFee: number; // in hundredths of basis points
-  readonly liquidity: BigNumber;
-  readonly sqrtPriceX96: BigNumber;
+  readonly liquidity: bigint;
+  readonly sqrtPriceX96: bigint;
   readonly tick: number;
   readonly lastUpdateBlock: BlockNumber;
 }
@@ -54,7 +53,7 @@ export interface MarketData {
   readonly poolId: PoolId;
   readonly timestamp: number;
   readonly volatility: number; // 24h historical volatility
-  readonly volume24h: BigNumber;
+  readonly volume24h: bigint;
   readonly volumeChange: number; // % change from previous period
   readonly priceChange: number; // % price change
   readonly spread: number; // bid-ask spread
@@ -114,7 +113,7 @@ export interface OptimizationConfig {
 export interface OptimalFee {
   readonly fee: number; // in hundredths of basis points
   readonly confidence: number; // 0.0 to 1.0
-  readonly expectedVolume: BigNumber;
+  readonly expectedVolume: bigint;
   readonly expectedRevenue: Wei;
   readonly reasoning: string;
 }
@@ -136,7 +135,7 @@ export interface ManagerOperation {
   readonly type: 'SET_FEE' | 'WITHDRAW_FEES' | 'EXECUTE_ARBITRAGE';
   readonly poolId: PoolId;
   readonly params: unknown;
-  readonly estimatedGas: BigNumber;
+  readonly estimatedGas: bigint;
   readonly priority: number; // 0-10, higher = more urgent
 }
 

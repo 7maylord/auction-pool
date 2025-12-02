@@ -3,7 +3,7 @@
  * Functional reactive approach
  */
 
-import { Wallet, providers, BigNumber } from 'ethers';
+import { Wallet, JsonRpcProvider } from 'ethers';
 import { filter, switchMap, tap } from 'rxjs/operators';
 import { combineLatest, interval } from 'rxjs';
 
@@ -49,7 +49,7 @@ const main = async () => {
   });
 
   // Initialize provider and wallet
-  const provider = new providers.JsonRpcProvider(config.network.rpcUrl);
+  const provider = new JsonRpcProvider(config.network.rpcUrl);
   const wallet = new Wallet(config.operator.privateKey, provider);
   const operatorAddress = await wallet.getAddress();
 
@@ -169,14 +169,14 @@ const main = async () => {
 
           // Check if fee update is warranted
           const feeData = await provider.getFeeData();
-          const gasPrice = feeData.gasPrice || BigNumber.from('20000000000');
+          const gasPrice = feeData.gasPrice || 20000000000n;
 
           const currentRevenue = poolState.liquidity
-            .mul(poolState.swapFee)
-            .div(1000000);
+            * BigInt(poolState.swapFee)
+            / 1000000n;
 
           const optimalRevenue = optimalFee.expectedRevenue.value;
-          const revenueDelta = optimalRevenue.sub(currentRevenue);
+          const revenueDelta = optimalRevenue - currentRevenue;
 
           if (shouldUpdateFee(poolState.swapFee, optimalFee.fee, gasPrice, revenueDelta)) {
             poolLogger.info('Updating swap fee', {
@@ -234,7 +234,7 @@ const main = async () => {
           // Get current block and gas price
           const blockNumber = await provider.getBlockNumber();
           const feeData = await provider.getFeeData();
-          const gasPrice = feeData.gasPrice || BigNumber.from('20000000000');
+          const gasPrice = feeData.gasPrice || 20000000000n;
 
           // Calculate bid decision
           const bidResult = adaptiveBidStrategy({
@@ -310,7 +310,7 @@ const main = async () => {
 
         const accumulatedFees = feesResult.right;
 
-        if (accumulatedFees.value.isZero()) return;
+        if (accumulatedFees.value === 0n) return;
 
         poolLogger.debug('Accumulated fees', {
           amount: accumulatedFees.value.toString()
@@ -318,12 +318,12 @@ const main = async () => {
 
         // Check if withdrawal is profitable
         const feeData = await provider.getFeeData();
-        const gasPrice = feeData.gasPrice || BigNumber.from('20000000000');
+        const gasPrice = feeData.gasPrice || 20000000000n;
 
-        const estimatedGas = BigNumber.from(100000);
-        const gasCost = gasPrice.mul(estimatedGas);
+        const estimatedGas = 100000n;
+        const gasCost = gasPrice * estimatedGas;
 
-        if (accumulatedFees.value.gte(gasCost.mul(2))) {
+        if (accumulatedFees.value >= gasCost * 2n) {
           poolLogger.info('Withdrawing manager fees', {
             amount: accumulatedFees.value.toString()
           });

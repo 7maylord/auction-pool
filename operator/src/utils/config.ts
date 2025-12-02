@@ -3,9 +3,8 @@
  */
 
 import * as dotenv from 'dotenv';
-import { BigNumber } from 'ethers';
-import { Config, ConfigCodec, Result, Right, Left } from '../core/types';
-import { isRight } from 'io-ts';
+import { Config, ConfigCodec, Result, Right, Left, isRight } from '../core/types';
+import * as Either from 'fp-ts/Either';
 
 dotenv.config();
 
@@ -60,7 +59,7 @@ export const loadConfig = (): Result<string, Config> => {
 
     // Validate using io-ts
     const validation = ConfigCodec.decode(config);
-    if (isRight(validation)) {
+    if (Either.isRight(validation)) {
       return Right(validation.right);
     } else {
       return Left('Configuration validation failed');
@@ -90,7 +89,7 @@ export interface OperatorConfig {
   };
   readonly strategy: {
     readonly minProfitMargin: number;
-    readonly maxBidAmountWei: BigNumber;
+    readonly maxBidAmountWei: bigint;
     readonly riskTolerance: number;
   };
   readonly optimization: {
@@ -107,7 +106,7 @@ export interface OperatorConfig {
   };
   readonly gas: {
     readonly priceMultiplier: number;
-    readonly maxPriorityFeePerGas?: BigNumber;
+    readonly maxPriorityFeePerGas?: bigint;
   };
 }
 
@@ -128,7 +127,7 @@ export const createOperatorConfig = (baseConfig: Config): OperatorConfig => {
     },
     strategy: {
       minProfitMargin: baseConfig.minProfitMargin,
-      maxBidAmountWei: BigNumber.from(baseConfig.maxBidAmountEth * 1e18),
+      maxBidAmountWei: BigInt(Math.floor(baseConfig.maxBidAmountEth * 1e18)),
       riskTolerance: getEnvNumber('RISK_TOLERANCE', 0.5)
     },
     optimization: {
