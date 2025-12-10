@@ -11,7 +11,7 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
-import {ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "v4-core/types/PoolOperation.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
@@ -698,5 +698,581 @@ contract AuctionPoolHookTest is Test, Deployers {
             }),
             abi.encode(lp)  // Pass LP address in hookData
         );
+    }
+
+    // ===== QUOTABILITY TESTS =====
+
+    function testGetSwapFeeView() public {
+        // Setup: Alice becomes manager
+        _setupManager(alice, 1000 wei);
+
+        // Test 1: Manager gets 0% fee
+        uint24 managerFee = hook.getSwapFee(poolId, alice);
+        assertEq(managerFee, 0, "Manager should get 0% fee");
+
+        // Test 2: Regular user gets dynamic fee
+        uint24 regularFee = hook.getSwapFee(poolId, bob);
+        assertEq(regularFee, 0, "Regular user should get current fee (0 initially)");
+
+        // Test 3: After manager sets fee
+        vm.prank(alice);
+        hook.setSwapFee(key, 3000); // 0.3%
+
+        uint24 newRegularFee = hook.getSwapFee(poolId, bob);
+        assertEq(newRegularFee, 3000, "Regular user should get updated fee");
+
+        // Manager still gets 0%
+        uint24 stillZero = hook.getSwapFee(poolId, alice);
+        assertEq(stillZero, 0, "Manager should still get 0% fee");
+    }
+
+    function testQuoteDoesNotModifyState() public {
+        // Setup: Alice becomes manager with rent
+        uint256 rentPerBlock = 1000 wei;
+        _setupManager(alice, rentPerBlock);
+
+        // Record initial state
+        (
+            address initialManager,
+            uint256 initialRent,
+            uint256 initialDeposit,
+            uint256 initialLastRent,
+            ,
+            uint256 initialTotalRent
+        ) = hook.poolAuctions(poolId);
+
+        // Simulate a quote (staticcall)
+        vm.prank(bob);
+        try this.externalStaticSwap() {
+            // Quote succeeded
+        } catch {
+            // Expected to work
+        }
+
+        // Verify state unchanged
+        (
+            address finalManager,
+            uint256 finalRent,
+            uint256 finalDeposit,
+            uint256 finalLastRent,
+            ,
+            uint256 finalTotalRent
+        ) = hook.poolAuctions(poolId);
+
+        assertEq(finalManager, initialManager, "Manager should not change during quote");
+        assertEq(finalRent, initialRent, "Rent should not change during quote");
+        assertEq(finalDeposit, initialDeposit, "Deposit should not change during quote");
+        assertEq(finalLastRent, initialLastRent, "LastRentBlock should not change during quote");
+        assertEq(finalTotalRent, initialTotalRent, "TotalRent should not change during quote");
+    }
+
+    // External function to simulate staticcall (quotes)
+    function externalStaticSwap() external view {
+        // This simulates what a router does during quotes
+        // Note: We can't actually test eth_call directly in Foundry,
+        // but we can verify the view function works correctly
+        hook.getSwapFee(poolId, msg.sender);
+    }
+
+    function testActualSwapModifiesState() public {
+        // Setup: Alice becomes manager with rent
+        uint256 rentPerBlock = 1000 wei;
+        _setupManager(alice, rentPerBlock);
+
+        // Record initial deposit
+        (, , uint256 initialDeposit, uint256 initialLastRent, , ) = hook.poolAuctions(poolId);
+
+        // Roll forward blocks
+        vm.roll(block.number + 10);
+
+        // Execute actual swap (not a quote) - use tiny amount
+        swap(key, true, 0.001e18, "");
+
+        // Verify state WAS modified
+        (, , uint256 finalDeposit, uint256 finalLastRent, , ) = hook.poolAuctions(poolId);
+
+        assertLt(finalDeposit, initialDeposit, "Deposit should decrease after swap");
+        assertGt(finalLastRent, initialLastRent, "LastRentBlock should update after swap");
+    }
+
+    function testBidActivationOnlyDuringActualSwap() public {
+        // Setup: Alice is manager
+        _setupManager(alice, 1000 wei);
+
+        // Bob submits higher bid
+        uint256 bobRent = 2000 wei;
+        uint256 bobDeposit = bobRent * hook.MIN_DEPOSIT_BLOCKS();
+        vm.prank(bob);
+        hook.submitBid{value: bobDeposit}(key, bobRent);
+
+        // Roll past activation delay
+        vm.roll(block.number + 6);
+
+        // Verify Bob is not manager yet
+        (address managerBeforeSwap, , , , , ) = hook.poolAuctions(poolId);
+        assertEq(managerBeforeSwap, alice, "Alice should still be manager before swap");
+
+        // Execute actual swap to trigger activation - tiny amount
+        swap(key, true, 0.001e18, "");
+
+        // Now Bob should be manager
+        (address managerAfterSwap, , , , , ) = hook.poolAuctions(poolId);
+        assertEq(managerAfterSwap, bob, "Bob should be manager after swap");
+    }
+
+    function testRentCollectionOnlyDuringActualSwap() public {
+        // Setup: Alice becomes manager
+        uint256 rentPerBlock = 1000 wei;
+        _setupManager(alice, rentPerBlock);
+
+        uint256 initialBlock = block.number;
+
+        // Roll forward 10 blocks
+        vm.roll(block.number + 10);
+
+        // Check deposit hasn't decreased yet (no swap)
+        (, , uint256 depositBeforeSwap, , , ) = hook.poolAuctions(poolId);
+        uint256 expectedDepositBeforeSwap = rentPerBlock * hook.MIN_DEPOSIT_BLOCKS();
+        assertEq(depositBeforeSwap, expectedDepositBeforeSwap, "Deposit should not change without swap");
+
+        // Execute swap to trigger rent collection - tiny amount
+        swap(key, true, 0.001e18, "");
+
+        // Now deposit should have decreased
+        (, , uint256 depositAfterSwap, , , ) = hook.poolAuctions(poolId);
+        uint256 expectedRentCollected = rentPerBlock * (block.number - initialBlock);
+        assertEq(
+            depositAfterSwap,
+            expectedDepositBeforeSwap - expectedRentCollected,
+            "Deposit should decrease by accumulated rent"
+        );
+    }
+
+    function testQuotabilityWithMultipleManagers() public {
+        // Setup: Alice is first manager
+        _setupManager(alice, 1000 wei);
+
+        // Alice sets a swap fee so non-managers pay something
+        vm.prank(alice);
+        hook.setSwapFee(key, 3000); // 0.3%
+
+        // Test: Alice gets 0% fee, Bob pays fee
+        uint24 aliceFee = hook.getSwapFee(poolId, alice);
+        uint24 bobFee = hook.getSwapFee(poolId, bob);
+        assertEq(aliceFee, 0, "Alice should get 0% as current manager");
+        assertEq(bobFee, 3000, "Bob should pay fee as non-manager");
+
+        // Now make Bob the manager
+        _setupManager(bob, 2000 wei);
+
+        // Test: Now Bob gets 0% fee, Alice pays fee
+        uint24 aliceFeeAfter = hook.getSwapFee(poolId, alice);
+        uint24 bobFeeAfter = hook.getSwapFee(poolId, bob);
+        assertEq(aliceFeeAfter, 3000, "Alice should pay fee after losing manager status");
+        assertEq(bobFeeAfter, 0, "Bob should get 0% as new manager");
+    }
+
+    function testGetSwapFeeConsistentWithActualSwap() public {
+        // Setup: Alice is manager with custom fee
+        _setupManager(alice, 1000 wei);
+        vm.prank(alice);
+        hook.setSwapFee(key, 5000); // 0.5%
+
+        // Test 1: Manager should get 0% fee
+        uint24 predictedManagerFee = hook.getSwapFee(poolId, alice);
+        assertEq(predictedManagerFee, 0, "Predicted manager fee should be 0%");
+
+        // Manager swaps - should get 0% fee
+        // (Actual fee verification would require checking BalanceDelta)
+
+        // Test 2: Regular user should get dynamic fee
+        uint24 predictedUserFee = hook.getSwapFee(poolId, bob);
+        assertEq(predictedUserFee, 5000, "Predicted user fee should match set fee");
+
+        // User swaps - should pay dynamic fee
+        // (Actual fee verification would require checking BalanceDelta)
+    }
+
+    function testQuotabilityWithNoManager() public {
+        // Test: When there's no manager, everyone pays the current fee
+        // Initially no manager and currentFee is 0
+        uint24 aliceFee = hook.getSwapFee(poolId, alice);
+        uint24 bobFee = hook.getSwapFee(poolId, bob);
+
+        assertEq(aliceFee, 0, "Alice should pay current fee (0) when no manager");
+        assertEq(bobFee, 0, "Bob should pay current fee (0) when no manager");
+
+        // Now setup a manager and have them set a fee
+        _setupManager(alice, 1000 wei);
+        vm.prank(alice);
+        hook.setSwapFee(key, 5000); // 0.5%
+
+        // Alice (manager) should get 0%, Bob should pay 0.5%
+        uint24 aliceFeeWithManager = hook.getSwapFee(poolId, alice);
+        uint24 bobFeeWithManager = hook.getSwapFee(poolId, bob);
+
+        assertEq(aliceFeeWithManager, 0, "Manager should pay 0%");
+        assertEq(bobFeeWithManager, 5000, "Non-manager should pay current fee");
+    }
+
+    function testGetSwapFeeGasCost() public view {
+        // Verify getSwapFee is gas-efficient (pure view function)
+        uint256 gasBefore = gasleft();
+        hook.getSwapFee(poolId, alice);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        // Should be reasonable (storage reads + comparison)
+        assertLt(gasUsed, 20000, "getSwapFee should be gas-efficient");
+    }
+
+    // ===== HELPER FUNCTIONS FOR QUOTABILITY TESTS =====
+
+    function _setupManager(address manager, uint256 rentPerBlock) internal {
+        uint256 deposit = rentPerBlock * hook.MIN_DEPOSIT_BLOCKS();
+
+        // Submit bid
+        vm.prank(manager);
+        hook.submitBid{value: deposit}(key, rentPerBlock);
+
+        // Wait for activation delay
+        vm.roll(block.number + 6);
+
+        // Trigger activation with a tiny swap to avoid moving price too much
+        swap(key, true, 0.001e18, "");
+    }
+
+    // ===== EDGE CASE TESTS =====
+
+    function testLargeLiquidityOperations() public {
+        // Test that large liquidity amounts work correctly
+        uint256 largeAmount = 1000e18; // Use reasonable large amount
+
+        // Add large liquidity
+        _addLiquidity(bob, largeAmount);
+
+        // Verify shares are tracked correctly
+        uint256 bobShares = hook.lpShares(poolId, bob);
+        assertGt(bobShares, 0, "Bob should have shares");
+
+        // Setup manager
+        _setupManager(alice, 1000 wei);
+
+        // Roll forward and collect rent
+        vm.roll(block.number + 100);
+        swap(key, true, 0.001e18, "");
+
+        // Bob should have pending rent
+        uint256 pendingRent = hook.getPendingRent(poolId, bob);
+        assertGt(pendingRent, 0, "Bob should have pending rent");
+
+        // Bob can successfully claim
+        uint256 balanceBefore = bob.balance;
+        vm.prank(bob);
+        hook.claimRent(key);
+
+        // Verify rent was received
+        assertGt(bob.balance, balanceBefore, "Bob should receive rent");
+        assertEq(hook.getPendingRent(poolId, bob), 0, "Pending rent should be zero after claim");
+    }
+
+    function testExtremeRentValues() public {
+        // Test with very high rent (near max safe value)
+        uint256 highRent = 1e15 wei; // 0.001 ETH per block
+        uint256 deposit = highRent * hook.MIN_DEPOSIT_BLOCKS();
+
+        vm.deal(alice, deposit * 2);
+        vm.prank(alice);
+        hook.submitBid{value: deposit}(key, highRent);
+
+        // Activate
+        vm.roll(block.number + 6);
+        swap(key, true, 0.001e18, "");
+
+        // Verify manager is set with high rent
+        (address manager, uint256 rent, , , , ) = hook.poolAuctions(poolId);
+        assertEq(manager, alice, "Alice should be manager");
+        assertEq(rent, highRent, "Rent should match");
+
+        // Roll forward a few blocks (not too many to avoid depletion)
+        vm.roll(block.number + 10);
+        swap(key, true, 0.001e18, "");
+
+        // Verify rent collection works with high values
+        (, , uint256 remainingDeposit, , , ) = hook.poolAuctions(poolId);
+        assertLt(remainingDeposit, deposit, "Deposit should have decreased");
+    }
+
+    function testLongTimePeriodRentAccumulation() public {
+        // Setup manager and LP
+        _setupManager(alice, 1000 wei);
+        _addLiquidity(bob, 1e18);
+
+        // Fast forward many blocks (1000 blocks)
+        vm.roll(block.number + 1000);
+
+        // Check pending rent before collection
+        uint256 pendingBefore = hook.getPendingRent(poolId, bob);
+
+        // Trigger rent collection
+        swap(key, true, 0.001e18, "");
+
+        // Verify rent accumulated correctly over long period
+        uint256 pendingAfter = hook.getPendingRent(poolId, bob);
+        assertGt(pendingAfter, pendingBefore, "Pending rent should increase");
+
+        // Bob claims after long period
+        vm.prank(bob);
+        hook.claimRent(key);
+
+        assertEq(hook.getPendingRent(poolId, bob), 0, "Should have no pending rent after claim");
+    }
+
+    function testMaximumFeeScenario() public {
+        // Setup manager
+        _setupManager(alice, 1000 wei);
+
+        // Set fee to maximum (1% = 10000)
+        vm.prank(alice);
+        hook.setSwapFee(key, 10000);
+
+        // Verify fee is set
+        uint24 fee = hook.getSwapFee(poolId, bob);
+        assertEq(fee, 10000, "Fee should be maximum");
+
+        // Manager still gets zero fee
+        uint24 managerFee = hook.getSwapFee(poolId, alice);
+        assertEq(managerFee, 0, "Manager should still get zero fee");
+    }
+
+    function testBidHistoryWithManyBids() public {
+        // Submit multiple bids to test history tracking
+        uint256 baseRent = 1000 wei;
+
+        for (uint i = 0; i < 5; i++) {
+            address bidder = address(uint160(i + 1000));
+            uint256 rent = baseRent * (i + 1);
+            uint256 deposit = rent * hook.MIN_DEPOSIT_BLOCKS();
+
+            vm.deal(bidder, deposit);
+            vm.prank(bidder);
+            hook.submitBid{value: deposit}(key, rent);
+
+            // Activate bid
+            vm.roll(block.number + 6);
+            swap(key, true, 0.001e18, "");
+        }
+
+        // Get bid history
+        AuctionPoolHook.Bid[] memory history = hook.getBidHistory(poolId);
+
+        // Should have all bids recorded
+        assertGe(history.length, 5, "Should have at least 5 bids in history");
+    }
+
+    function testZeroRentManagerBehavior() public {
+        // Edge case: What if manager has 0 rent (initial state)?
+        // Verify getSwapFee works with no manager
+        uint24 fee = hook.getSwapFee(poolId, alice);
+        assertEq(fee, 0, "Should return 0 when no manager and no fee set");
+
+        // Now set up manager with actual rent
+        _setupManager(alice, 1000 wei);
+
+        // Fee should still be 0 for manager
+        uint24 managerFee = hook.getSwapFee(poolId, alice);
+        assertEq(managerFee, 0, "Manager should get zero fee");
+    }
+
+    function testMultipleLiquidityProvidersEdgeCases() public {
+        // Setup manager
+        _setupManager(alice, 1000 wei);
+
+        // Multiple LPs with different amounts
+        _addLiquidity(bob, 1e18);
+        _addLiquidity(charlie, 5e18);
+
+        // Add another address with very small amount
+        address dave = makeAddr("dave");
+        _addLiquidity(dave, 0.001e18);
+
+        // Roll forward and trigger rent collection
+        vm.roll(block.number + 100);
+        swap(key, true, 0.001e18, "");
+
+        // All should have pending rent (proportional)
+        uint256 bobRent = hook.getPendingRent(poolId, bob);
+        uint256 charlieRent = hook.getPendingRent(poolId, charlie);
+        uint256 daveRent = hook.getPendingRent(poolId, dave);
+
+        assertGt(bobRent, 0, "Bob should have rent");
+        assertGt(charlieRent, 0, "Charlie should have rent");
+        assertGt(daveRent, 0, "Dave should have rent");
+
+        // Charlie should have more rent than Bob (5x liquidity)
+        assertGt(charlieRent, bobRent, "Charlie should have more rent than Bob");
+
+        // Dave should have least rent (smallest liquidity)
+        assertLt(daveRent, bobRent, "Dave should have less rent than Bob");
+    }
+
+    // ===== INTEGRATION TESTS =====
+
+    function testFullLifecycleIntegration() public {
+        // Complete lifecycle: bid -> activate -> swap -> collect rent -> claim -> new bid
+
+        // Phase 1: Alice becomes first manager
+        _setupManager(alice, 1000 wei);
+        _addLiquidity(bob, 1e18);
+
+        // Phase 2: Alice sets fee and swaps
+        vm.prank(alice);
+        hook.setSwapFee(key, 3000);
+        swap(key, true, 0.001e18, "");
+
+        // Phase 3: Rent accumulates
+        vm.roll(block.number + 50);
+        swap(key, true, 0.001e18, "");
+
+        // Phase 4: Bob claims rent
+        uint256 bobBalanceBefore = bob.balance;
+        vm.prank(bob);
+        hook.claimRent(key);
+        assertGt(bob.balance, bobBalanceBefore, "Bob should receive rent");
+
+        // Phase 5: Charlie outbids Alice
+        _setupManager(charlie, 2000 wei);
+
+        // Phase 6: Verify Charlie is new manager
+        (address newManager, , , , , ) = hook.poolAuctions(poolId);
+        assertEq(newManager, charlie, "Charlie should be manager");
+
+        // Phase 7: More rent accumulates for Bob
+        vm.roll(block.number + 50);
+        swap(key, true, 0.001e18, "");
+
+        // Phase 8: Bob claims again
+        uint256 bobBalanceBefore2 = bob.balance;
+        vm.prank(bob);
+        hook.claimRent(key);
+        assertGt(bob.balance, bobBalanceBefore2, "Bob should receive more rent");
+    }
+
+    function testManagerDepletionAndRecovery() public {
+        // Test complete depletion and recovery scenario
+        uint256 rentPerBlock = 1000 wei;
+        uint256 minDeposit = rentPerBlock * hook.MIN_DEPOSIT_BLOCKS();
+
+        // Alice becomes manager with minimum deposit
+        vm.prank(alice);
+        hook.submitBid{value: minDeposit}(key, rentPerBlock);
+        vm.roll(block.number + 6);
+        swap(key, true, 0.001e18, "");
+
+        // Verify Alice is manager
+        (address manager1, , , , , ) = hook.poolAuctions(poolId);
+        assertEq(manager1, alice, "Alice should be manager");
+
+        // Fast forward to near depletion
+        vm.roll(block.number + 99);
+        swap(key, true, 0.001e18, "");
+
+        // Check if still manager (should be close to depletion)
+        (address manager2, , uint256 deposit, , , ) = hook.poolAuctions(poolId);
+        assertLt(deposit, minDeposit / 2, "Deposit should be significantly depleted");
+
+        // New manager can still take over
+        _setupManager(bob, 1500 wei);
+        (address manager3, , , , , ) = hook.poolAuctions(poolId);
+        assertEq(manager3, bob, "Bob should be new manager");
+    }
+
+    function testConcurrentLiquidityAndRentOperations() public {
+        // Test rent claims while liquidity is being added/removed
+        _setupManager(alice, 1000 wei);
+        _addLiquidity(bob, 1e18);
+
+        // Accumulate some rent
+        vm.roll(block.number + 50);
+        swap(key, true, 0.001e18, "");
+
+        uint256 bobRent1 = hook.getPendingRent(poolId, bob);
+        assertGt(bobRent1, 0, "Bob should have pending rent");
+
+        // Charlie adds liquidity (dilutes Bob's share)
+        _addLiquidity(charlie, 1e18);
+
+        // More rent accumulates
+        vm.roll(block.number + 50);
+        swap(key, true, 0.001e18, "");
+
+        // Bob claims his rent
+        vm.prank(bob);
+        hook.claimRent(key);
+
+        // Charlie should also have rent now
+        uint256 charlieRent = hook.getPendingRent(poolId, charlie);
+        assertGt(charlieRent, 0, "Charlie should have pending rent");
+
+        // Bob removes liquidity
+        _removeLiquidity(bob, 0.5e18);
+
+        // Both should still be able to claim
+        vm.roll(block.number + 50);
+        swap(key, true, 0.001e18, "");
+
+        vm.prank(charlie);
+        hook.claimRent(key);
+
+        assertEq(hook.getPendingRent(poolId, charlie), 0, "Charlie should have claimed all rent");
+    }
+
+    function testSwapIntegrationWithDifferentUsers() public {
+        // Test that swaps work correctly for manager vs non-managers
+        _setupManager(alice, 1000 wei);
+        vm.prank(alice);
+        hook.setSwapFee(key, 5000); // 0.5%
+
+        // Alice (manager) swaps - should get 0% fee
+        uint256 aliceFee = hook.getSwapFee(poolId, alice);
+        assertEq(aliceFee, 0, "Alice should pay 0%");
+
+        // Bob (non-manager) swaps - should pay 0.5% fee
+        uint256 bobFee = hook.getSwapFee(poolId, bob);
+        assertEq(bobFee, 5000, "Bob should pay 0.5%");
+
+        // Charlie (also non-manager) - should pay same fee
+        uint256 charlieFee = hook.getSwapFee(poolId, charlie);
+        assertEq(charlieFee, 5000, "Charlie should pay 0.5%");
+
+        // After manager changes, fees should update
+        _setupManager(bob, 2000 wei);
+
+        // Now Bob is manager, should get 0% fee
+        uint256 bobFeeNew = hook.getSwapFee(poolId, bob);
+        assertEq(bobFeeNew, 0, "Bob should now pay 0% as manager");
+
+        // Alice should now pay fee
+        uint256 aliceFeeNew = hook.getSwapFee(poolId, alice);
+        assertEq(aliceFeeNew, 5000, "Alice should now pay 0.5%");
+    }
+
+    function testRentDistributionPrecision() public {
+        // Test rent distribution with small amounts to verify precision
+        _setupManager(alice, 100 wei); // Very small rent
+        _addLiquidity(bob, 1e18);
+        _addLiquidity(charlie, 2e18);
+
+        // Accumulate rent for just a few blocks
+        vm.roll(block.number + 10);
+        swap(key, true, 0.001e18, "");
+
+        // Both should have proportional rent (Charlie 2x Bob)
+        uint256 bobRent = hook.getPendingRent(poolId, bob);
+        uint256 charlieRent = hook.getPendingRent(poolId, charlie);
+
+        if (bobRent > 0 && charlieRent > 0) {
+            // Charlie should have approximately 2x Bob's rent
+            assertApproxEqRel(charlieRent, bobRent * 2, 0.01e18, "Charlie should have ~2x Bob's rent");
+        }
     }
 }

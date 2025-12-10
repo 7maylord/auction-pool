@@ -271,6 +271,25 @@ contract AuctionPoolHook is BaseHook {
     // ===== VIEW FUNCTIONS =====
 
     /**
+     * @notice Calculate the swap fee for a given sender (quotable, no state changes)
+     * @param poolId Pool identifier
+     * @param sender Address performing the swap
+     * @return swapFee The fee that will be charged (0 for manager, dynamic for others)
+     * @dev This function is safe to call via eth_call for quotes
+     */
+    function getSwapFee(PoolId poolId, address sender) public view returns (uint24 swapFee) {
+        AuctionState storage state = poolAuctions[poolId];
+
+        // Manager gets zero fee for arbitrage capture
+        if (sender == state.currentManager) {
+            return 0;
+        }
+
+        // Everyone else pays current dynamic fee
+        return state.currentFee;
+    }
+
+    /**
      * @notice Get pending rent for an LP
      * @param poolId Pool identifier
      * @param lp LP address
@@ -300,8 +319,12 @@ contract AuctionPoolHook is BaseHook {
     /**
      * @notice Update auction - switch to new manager if bid is ready
      * @param poolId Pool identifier
+     * @dev Only executes on actual transactions, not on eth_call quotes (quotability fix)
      */
     function _updateAuction(PoolId poolId) internal {
+        // Skip state updates during quotes (eth_call has tx.origin == address(0))
+        if (tx.origin == address(0)) return;
+
         AuctionState storage state = poolAuctions[poolId];
         Bid storage next = nextBid[poolId];
 
@@ -351,8 +374,12 @@ contract AuctionPoolHook is BaseHook {
     /**
      * @notice Collect rent from manager and distribute to LPs
      * @param poolId Pool identifier
+     * @dev Only executes on actual transactions, not on eth_call quotes (quotability fix)
      */
     function _collectRent(PoolId poolId) internal {
+        // Skip state updates during quotes (eth_call has tx.origin == address(0))
+        if (tx.origin == address(0)) return;
+
         AuctionState storage state = poolAuctions[poolId];
 
         if (state.currentManager == address(0) || state.lastRentBlock == 0) return;
@@ -409,6 +436,8 @@ contract AuctionPoolHook is BaseHook {
      * @return selector_ The function selector for the hook
      * @return beforeSwapDelta_ The hook's delta in specified and unspecified currencies
      * @return swapFee_ The dynamic fee applied to the swap
+     * @dev This hook is quotable: state updates only occur on actual transactions,
+     *      not during eth_call quotes. Fee calculation is pure and works for both.
      */
     function _beforeSwap(
         address sender,
@@ -417,21 +446,15 @@ contract AuctionPoolHook is BaseHook {
         bytes calldata hookData
     ) internal override returns (bytes4 selector_, BeforeSwapDelta beforeSwapDelta_, uint24 swapFee_) {
         PoolId poolId = key.toId();
-        AuctionState storage state = poolAuctions[poolId];
 
-        // Step 1: Update auction if needed (check if new bidder should take over)
+        // Step 1: Update auction if needed (skips on quotes via tx.origin check)
         _updateAuction(poolId);
 
-        // Step 2: Collect rent from current manager
+        // Step 2: Collect rent from current manager (skips on quotes via tx.origin check)
         _collectRent(poolId);
 
-        // Step 3: Get current dynamic fee
-        uint24 swapFee = state.currentFee;
-
-        // Special case: If sender is the manager, they trade with zero fee
-        if (sender == state.currentManager) {
-            swapFee = 0; // Manager can arb for free
-        }
+        // Step 3: Get current dynamic fee (works for both quotes and actual swaps)
+        uint24 swapFee = getSwapFee(poolId, sender);
 
         return (
             IHooks.beforeSwap.selector,

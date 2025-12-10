@@ -1,4 +1,4 @@
-module auction-pool-operator
+module auction-pool/operator
 
 go 1.21
 
@@ -14,8 +14,9 @@ require (
 	github.com/deckarep/golang-set/v2 v2.5.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.2.0 // indirect
 	github.com/ethereum/c-kzg-4844 v0.4.0 // indirect
+	github.com/fsnotify/fsnotify v1.6.0 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
-	github.com/go-stack/stack v1.8.1 // indirect
+	github.com/google/uuid v1.3.0 // indirect
 	github.com/gorilla/websocket v1.5.1 // indirect
 	github.com/holiman/uint256 v1.2.4 // indirect
 	github.com/mmcloughlin/addchain v0.4.0 // indirect
@@ -27,6 +28,7 @@ require (
 	golang.org/x/crypto v0.18.0 // indirect
 	golang.org/x/exp v0.0.0-20231226003508-02704c960a9b // indirect
 	golang.org/x/mod v0.14.0 // indirect
+	golang.org/x/net v0.20.0 // indirect
 	golang.org/x/sync v0.6.0 // indirect
 	golang.org/x/sys v0.16.0 // indirect
 	golang.org/x/tools v0.17.0 // indirect
