@@ -19,19 +19,6 @@ import {IPoolManager} from '@uniswap/v4-core/src/interfaces/IPoolManager.sol';
 import {BaseHook} from 'v4-periphery/src/utils/BaseHook.sol';
 
 
-/**
- * @title AuctionPoolHook - Auction-Managed AMM
- * @notice Implements an auction mechanism where sophisticated operators bid for the right
- * to manage a pool, set dynamic fees, and capture arbitrage opportunities.
- * @dev Based on research from Uniswap Labs and Paradigm (https://arxiv.org/abs/2403.03367)
- *
- * Key features:
- * - Continuous auction for pool management rights
- * - Dynamic fee setting by managers (up to MAX_FEE cap)
- * - Guaranteed rent payments to LPs
- * - Zero-fee trading for managers to capture arbitrage
- * - Censorship-resistant bid activation delays
- */
 contract AuctionPoolHook is BaseHook {
 
     using CurrencyLibrary for Currency;
@@ -39,11 +26,6 @@ contract AuctionPoolHook is BaseHook {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
-    // ===== AUCTION STATE STRUCTS =====
-
-    /**
-     * @notice Current state of the auction for a pool
-     */
     struct AuctionState {
         address currentManager;      // Current pool manager address
         uint256 rentPerBlock;        // Current rent rate (wei per block)
@@ -53,9 +35,6 @@ contract AuctionPoolHook is BaseHook {
         uint256 totalRentPaid;       // Cumulative rent paid (for stats)
     }
 
-    /**
-     * @notice Represents a bid to become pool manager
-     */
     struct Bid {
         address bidder;              // Address of bidder
         uint256 rentPerBlock;        // Rent they're willing to pay
@@ -64,15 +43,11 @@ contract AuctionPoolHook is BaseHook {
         uint256 timestamp;           // When bid was submitted
     }
 
-    // ===== CONFIGURATION CONSTANTS =====
-
     uint24 public constant MAX_FEE = 10000;           // 1% max fee (in hundredths of bps)
     uint256 public constant ACTIVATION_DELAY = 5;      // blocks
     uint24 public constant WITHDRAWAL_FEE = 1;         // 0.01% (in hundredths of bps)
     uint256 public constant MIN_BID_INCREMENT = 100;   // 100 wei/block minimum increase
     uint256 public constant MIN_DEPOSIT_BLOCKS = 100;  // Deposit must cover 100 blocks
-
-    // ===== STATE MAPPINGS =====
 
     /// Pool ID => Auction State
     mapping(PoolId => AuctionState) public poolAuctions;
@@ -82,8 +57,6 @@ contract AuctionPoolHook is BaseHook {
 
     /// Pool ID => Bid history (for analytics)
     mapping(PoolId => Bid[]) public bidHistory;
-
-    // ===== LP TRACKING FOR RENT DISTRIBUTION =====
 
     /// Pool ID => LP address => shares
     mapping(PoolId => mapping(address => uint256)) public lpShares;
@@ -97,15 +70,10 @@ contract AuctionPoolHook is BaseHook {
     /// Pool ID => LP address => rent per share already claimed
     mapping(PoolId => mapping(address => uint256)) public rentPerShareClaimed;
 
-    // ===== MANAGER BALANCES =====
-
     /// Manager address => Pool ID => collected fees
     mapping(address => mapping(PoolId => uint256)) public managerFees;
 
-    /**
-     * @notice Constructor sets up the hook with PoolManager reference
-     * @param _poolManager Address of the Uniswap v4 PoolManager
-     */
+    
     constructor(address _poolManager) BaseHook(IPoolManager(_poolManager)) {}
 
     // ===== EVENTS =====
@@ -161,13 +129,7 @@ contract AuctionPoolHook is BaseHook {
         bool isAddition
     );
 
-    // ===== AUCTION MANAGEMENT FUNCTIONS =====
-
-    /**
-     * @notice Submit a bid to become pool manager
-     * @param key Pool key
-     * @param rentPerBlock Rent willing to pay per block (in wei)
-     */
+    
     function submitBid(
         PoolKey calldata key,
         uint256 rentPerBlock
@@ -210,11 +172,7 @@ contract AuctionPoolHook is BaseHook {
         emit BidSubmitted(poolId, msg.sender, rentPerBlock, msg.value);
     }
 
-    /**
-     * @notice Manager sets dynamic swap fee
-     * @param key Pool key
-     * @param newFee New fee in hundredths of basis points
-     */
+    
     function setSwapFee(
         PoolKey calldata key,
         uint24 newFee
@@ -230,10 +188,7 @@ contract AuctionPoolHook is BaseHook {
         emit FeeUpdated(poolId, msg.sender, newFee);
     }
 
-    /**
-     * @notice LP claims accumulated rent
-     * @param key Pool key
-     */
+    
     function claimRent(PoolKey calldata key) external {
         PoolId poolId = key.toId();
 
@@ -251,10 +206,7 @@ contract AuctionPoolHook is BaseHook {
         emit RentClaimed(poolId, msg.sender, claimable);
     }
 
-    /**
-     * @notice Manager withdraws accumulated fees
-     * @param key Pool key
-     */
+    
     function withdrawManagerFees(PoolKey calldata key) external {
         PoolId poolId = key.toId();
 
@@ -268,15 +220,7 @@ contract AuctionPoolHook is BaseHook {
         emit ManagerFeesWithdrawn(poolId, msg.sender, fees);
     }
 
-    // ===== VIEW FUNCTIONS =====
-
-    /**
-     * @notice Calculate the swap fee for a given sender (quotable, no state changes)
-     * @param poolId Pool identifier
-     * @param sender Address performing the swap
-     * @return swapFee The fee that will be charged (0 for manager, dynamic for others)
-     * @dev This function is safe to call via eth_call for quotes
-     */
+    
     function getSwapFee(PoolId poolId, address sender) public view returns (uint24 swapFee) {
         AuctionState storage state = poolAuctions[poolId];
 
@@ -289,12 +233,7 @@ contract AuctionPoolHook is BaseHook {
         return state.currentFee;
     }
 
-    /**
-     * @notice Get pending rent for an LP
-     * @param poolId Pool identifier
-     * @param lp LP address
-     * @return Pending rent amount
-     */
+    
     function getPendingRent(PoolId poolId, address lp) public view returns (uint256) {
         uint256 userShares = lpShares[poolId][lp];
         if (userShares == 0) return 0;
@@ -305,22 +244,12 @@ contract AuctionPoolHook is BaseHook {
         return (userShares * (accumulatedRent - claimedRent)) / 1e18;
     }
 
-    /**
-     * @notice Get bid history for a pool
-     * @param poolId Pool identifier
-     * @return Array of bids
-     */
+    
     function getBidHistory(PoolId poolId) external view returns (Bid[] memory) {
         return bidHistory[poolId];
     }
 
-    // ===== INTERNAL AUCTION LOGIC =====
-
-    /**
-     * @notice Update auction - switch to new manager if bid is ready
-     * @param poolId Pool identifier
-     * @dev Only executes on actual transactions, not on eth_call quotes (quotability fix)
-     */
+   
     function _updateAuction(PoolId poolId) internal {
         // Skip state updates during quotes (eth_call has tx.origin == address(0))
         if (tx.origin == address(0)) return;
@@ -371,11 +300,7 @@ contract AuctionPoolHook is BaseHook {
         }
     }
 
-    /**
-     * @notice Collect rent from manager and distribute to LPs
-     * @param poolId Pool identifier
-     * @dev Only executes on actual transactions, not on eth_call quotes (quotability fix)
-     */
+    
     function _collectRent(PoolId poolId) internal {
         // Skip state updates during quotes (eth_call has tx.origin == address(0))
         if (tx.origin == address(0)) return;
@@ -400,11 +325,7 @@ contract AuctionPoolHook is BaseHook {
         }
     }
 
-    /**
-     * @notice Distribute rent to LPs proportionally using rewards-per-share accounting
-     * @param poolId Pool identifier
-     * @param amount Total rent amount to distribute
-     */
+    
     function _distributeRent(PoolId poolId, uint256 amount) internal {
         uint256 total = totalShares[poolId];
 
@@ -414,10 +335,7 @@ contract AuctionPoolHook is BaseHook {
         rentPerShareAccumulated[poolId] += (amount * 1e18) / total;
     }
 
-    /**
-     * @notice Refund the current next bidder
-     * @param poolId Pool identifier
-     */
+    
     function _refundBid(PoolId poolId) internal {
         Bid storage bid = nextBid[poolId];
         if (bid.bidder != address(0) && bid.deposit > 0) {
@@ -425,20 +343,7 @@ contract AuctionPoolHook is BaseHook {
         }
     }
 
-    // ===== HOOK IMPLEMENTATIONS =====
-
-    /**
-     * @notice Before swap hook - apply dynamic fee and collect rent
-     * @param sender The initial msg.sender for the swap call
-     * @param key The key for the pool
-     * @param params The parameters for the swap
-     * @param hookData Arbitrary data handed into the PoolManager
-     * @return selector_ The function selector for the hook
-     * @return beforeSwapDelta_ The hook's delta in specified and unspecified currencies
-     * @return swapFee_ The dynamic fee applied to the swap
-     * @dev This hook is quotable: state updates only occur on actual transactions,
-     *      not during eth_call quotes. Fee calculation is pure and works for both.
-     */
+    
     function _beforeSwap(
         address sender,
         PoolKey calldata key,
@@ -463,16 +368,7 @@ contract AuctionPoolHook is BaseHook {
         );
     }
 
-    /**
-     * @notice After swap hook - track fees collected
-     * @param sender The initial msg.sender for the swap call
-     * @param key The key for the pool
-     * @param params The parameters for the swap
-     * @param delta The amount owed to the caller (positive) or owed to the pool (negative)
-     * @param hookData Arbitrary data handed into the PoolManager
-     * @return selector_ The function selector for the hook
-     * @return hookDeltaUnspecified_ The hook's delta in unspecified currency
-     */
+   
     function _afterSwap(
         address sender,
         PoolKey calldata key,
@@ -485,14 +381,7 @@ contract AuctionPoolHook is BaseHook {
         return (IHooks.afterSwap.selector, 0);
     }
 
-    /**
-     * @notice Before remove liquidity hook - charge withdrawal fee and update shares
-     * @param sender The initial msg.sender
-     * @param key The key for the pool
-     * @param params The parameters for modifying liquidity
-     * @param hookData Arbitrary data handed into the PoolManager
-     * @return selector_ The function selector for the hook
-     */
+    
     function _beforeRemoveLiquidity(
         address sender,
         PoolKey calldata key,
@@ -534,17 +423,7 @@ contract AuctionPoolHook is BaseHook {
         return IHooks.beforeRemoveLiquidity.selector;
     }
 
-    /**
-     * @notice After add liquidity hook - update LP shares
-     * @param sender The initial msg.sender
-     * @param key The key for the pool
-     * @param params The parameters for modifying liquidity
-     * @param delta The caller's balance delta
-     * @param feesAccrued The fees accrued since the last time fees were collected from this position
-     * @param hookData Arbitrary data handed into the PoolManager
-     * @return selector_ The function selector for the hook
-     * @return hookDelta_ The hook's delta in specified and unspecified currencies
-     */
+   
     function _afterAddLiquidity(
         address sender,
         PoolKey calldata key,
@@ -585,9 +464,7 @@ contract AuctionPoolHook is BaseHook {
         return (IHooks.afterAddLiquidity.selector, BalanceDelta.wrap(0));
     }
 
-    /**
-     * @notice Defines the hook permissions
-     */
+    
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: false,
